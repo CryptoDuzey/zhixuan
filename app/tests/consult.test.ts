@@ -353,7 +353,7 @@ function mockNetwork(t: TestContext, failure = false) {
     rmSync(directory, { recursive: true, force: true });
   });
   const docs = MODELS.filter((m) => m.ready).flatMap((m) => [
-    { id: `${m.id}-fact`, path: `${m.dir}产品事实.md`, value: '# 产品事实\n屏幕：14英寸\n机身：轻薄设计，适合移动办公\n' },
+    { id: `${m.id}-fact`, path: `${m.dir}产品事实.md`, value: `# ${m.name}\n屏幕：14英寸\n机身：轻薄设计，适合移动办公\n` },
     { id: `${m.id}-limit`, path: `${m.dir}卖点与限制.md`, value: '# 使用限制\n必须核实关键软件、插件和外设的实际兼容情况。\n' },
     { id: `${m.id}-price`, path: `08-官方公开价格快照/${m.priceTitle}`, value: '# 官方价格卡\n快照日期：2026-08-01\n配置：16GB + 1TB\n价格：6999元\n' },
     ...['商务差旅', '学生'].map((scene) => ({ id: `${m.id}-${scene}`, path: `P2-卖点话术库/07-按型号角色/${m.sceneDir}${scene}用户沟通卡.md`, value: `# ${scene}\n先验证实际任务，再考虑对应设备。\n` })),
@@ -366,12 +366,15 @@ function mockNetwork(t: TestContext, failure = false) {
       assert.equal(target.pathname, '/v1/chat/completions');
       if (failure) return Response.json({ error: { message: 'private-upstream-secret' } }, { status: 401 });
       const payload = JSON.parse(String(init?.body));
+      if (payload.messages[0].content.includes('产品目录路由器')) {
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ candidateIds: ['catalog:pro-s-fact'] }) } }] });
+      }
       const source = payload.messages[1].content;
       const supplied = JSON.parse(source.slice(source.indexOf('：') + 1));
-      const first = supplied.find((p: { model: ModelEntry }) => p.model.id === 'pro-s');
+      const first = supplied.find((p: { model: ModelEntry }) => p.model.id === 'catalog:pro-s-fact');
       assert.ok(first);
       assert.ok(!first.evidence.some((e: Evidence) => e.kind === 'price'));
-      return Response.json({ choices: [{ message: { content: JSON.stringify(data([rec('pro-s', [first.evidence[0].id])])) } }] });
+      return Response.json({ choices: [{ message: { content: JSON.stringify(data([rec(first.model.id, [first.evidence[0].id])])) } }] });
     }
     if (target.pathname === '/documents') return Response.json({ items: docs.map((d) => ({ ...d, title: d.id, bytes: d.value.length, sha256: 'offline' })) });
     if (target.pathname === '/document') {
@@ -389,8 +392,9 @@ test('实际POST完整链路：本地资料API和chatJson均走网络替身，�
   const response = await POST(request(ask()));
   assert.equal(response.status, 200);
   const answer = await response.json();
-  assert.equal(network.modelCalls(), 1);
-  assert.equal(answer.recommendations[0].modelId, 'pro-s');
+  assert.equal(network.modelCalls(), 2);
+  assert.equal(answer.recommendations[0].modelId, 'catalog:pro-s-fact');
+  assert.equal(answer.recommendations[0].creativeModelId, 'pro-s');
   assert.ok(answer.evidence[0].docPath.includes('产品事实.md'));
   assert.ok(answer.evidence[0].line > 0);
   assert.match(answer.reply, /不能保证兼容/);
@@ -403,4 +407,119 @@ test('实际POST模型失败只返回可读错误，不泄漏网关信息或密�
   const answer = await response.json();
   assert.match(answer.error, /稍后重试/);
   assert.doesNotMatch(JSON.stringify(answer), /private-upstream-secret|offline-only-placeholder|consult-gateway/);
+});
+
+test('完整目录查询直接按真实分类列出全部产品，不调用模型或读取产品正文', async () => {
+  const catalog = Array.from({ length: 61 }, (_, i) => ({
+    id: `catalog-${i}`, name: `目录产品${i}款`, category: i < 10 ? '电脑' : '其他设备',
+    system: '待核实', level: i < 10 ? 'full' : 'discovery',
+  }));
+  const deps = {
+    ...service(),
+    loadCatalog: async () => catalog,
+    loadCatalogEvidence: async () => { assert.fail('a directory request must not read product documents'); },
+    generate: async () => { assert.fail('a directory request must not call the model'); },
+  };
+  for (const query of ['有哪些产品？', '全部产品', '支持范围', '产品目录', '所有型号有哪些？']) {
+    const answer = await consult(ask(query), deps);
+    for (const item of catalog) assert.ok(answer.reply.includes(item.name), item.name);
+    assert.match(answer.reply, /电脑/);
+    assert.match(answer.reply, /其他设备/);
+    assert.match(answer.reply, /发现|待核实/);
+    assert.deepEqual(answer.recommendations, []);
+  }
+});
+
+test('目录路由严格校验ID且最多读取6款，显式点名优先；可推荐五款之外的完整产品', async () => {
+  const catalog = Array.from({ length: 12 }, (_, i) => ({
+    id: `catalog-${i}`, name: `真实设备${i}款`, category: '电脑', system: '待核实', level: 'full',
+    ...(i === 0 ? { creativeModelId: 'pro-s' } : i === 11 ? { creativeModelId: 'unconnected' } : {}),
+  }));
+  const loaded: string[] = [];
+  let calls = 0;
+  const deps = {
+    ...service(),
+    loadCatalog: async () => catalog,
+    loadEvidence: async () => { assert.fail('dynamic catalog must not read the five creative models'); },
+    loadCatalogEvidence: async (id: string) => { loaded.push(id); return [ev(`${id}-fact`, id)]; },
+    generate: async (messages: { content: string }[]) => {
+      calls++;
+      if (calls === 1) {
+        assert.match(messages[0].content, /产品目录路由器/);
+        for (const item of catalog) assert.ok(messages[1].content.includes(item.id));
+        return { candidateIds: ['unknown', 'pro-s', ...catalog.slice(0, 11).map((item) => item.id), 'catalog-0', null] };
+      }
+      assert.match(messages[1].content, /catalog-11/);
+      assert.doesNotMatch(messages[1].content, /catalog-10/);
+      return data([rec('catalog-11', ['catalog-11-fact', 'catalog-0-fact']), rec('catalog-0', ['catalog-0-fact']), rec('unknown', ['fake'])]);
+    },
+  };
+  const answer = await consult(ask('处理全部文档任务，想具体了解真实设备11款，先不讨论价格。'), deps);
+  assert.equal(calls, 2);
+  assert.deepEqual(loaded, ['catalog-11', 'catalog-0', 'catalog-1', 'catalog-2', 'catalog-3', 'catalog-4']);
+  assert.deepEqual(answer.recommendations.map((r) => r.modelId), ['catalog-11', 'catalog-0']);
+  assert.deepEqual(answer.recommendations[0].evidenceIds, ['catalog-11-fact']);
+  assert.equal(answer.recommendations[0].creativeModelId, undefined);
+  assert.equal(answer.recommendations[1].creativeModelId, 'pro-s');
+});
+
+test('发现卡只作为待核实候选，回复和卡片均不采用模型臆造规格、兼容和价格', async () => {
+  let calls = 0;
+  const deps = {
+    ...service(),
+    loadCatalog: async () => [{ id: 'tablet-discovery', name: '测试平板款', category: '平板', level: 'discovery' }],
+    loadCatalogEvidence: async (id: string) => [
+      ev(`${id}-discovery`, id, 'limit', '仅供产品发现，配置和兼容性需补充对应款式资料。'),
+      ev(`${id}-price`, id, 'price', '2026-10-17 16GB+1TB：6999元'),
+    ],
+    generate: async () => ++calls === 1 ? { candidateIds: ['tablet-discovery'] } : {
+      reply: '测试平板款采用64GB内存与999核心处理器。完全兼容所有软件。售价1元。',
+      recommendations: [{ ...rec('tablet-discovery', ['tablet-discovery-discovery']), reason: '64GB内存与999核心处理器。', tradeoff: '所有插件都能运行。', creativeModelId: 'pro-s' }],
+    },
+  };
+  const answer = await consult(ask('想了解测试平板款做笔记，多少钱？'), deps);
+  assert.match(answer.reply, /候选了解|待核实/);
+  assert.match(answer.recommendations[0].tradeoff, /未确认/);
+  assert.doesNotMatch(answer.reply + answer.recommendations[0].reason + answer.recommendations[0].tradeoff, /64GB|999核心|1元|6999|完全兼容|所有插件都能/);
+  assert.equal(answer.recommendations[0].creativeModelId, undefined);
+  assert.ok(!answer.evidence.some((e) => e.kind === 'price'));
+});
+
+test('路由没有合法候选时追问用途，不退回五款创作型号', async () => {
+  const deps = {
+    ...service(),
+    loadCatalog: async () => [{ id: 'dynamic-only', name: '真实耳机款', category: '耳机', level: 'discovery' }],
+    loadEvidence: async () => { assert.fail('must not fall back to creative models'); },
+    loadCatalogEvidence: async () => { assert.fail('must not read invalid route ids'); },
+    generate: async () => ({ candidateIds: ['pro-s', 'unknown', 42] }),
+  };
+  const answer = await consult(ask('我在户外工作，需要合适的设备'), deps);
+  assert.deepEqual(answer.recommendations, []);
+  assert.equal(answer.questions?.length, 3);
+});
+
+test('实际POST全目录查询只使用资料API，不调用模型', async (t) => {
+  const network = mockNetwork(t);
+  const response = await POST(request(ask('全部产品有哪些？')));
+  assert.equal(response.status, 200);
+  const answer = await response.json();
+  for (const model of MODELS.filter((m) => m.ready)) assert.ok(answer.reply.includes(model.name), model.name);
+  assert.equal(network.modelCalls(), 0);
+  assert.deepEqual(answer.recommendations, []);
+});
+
+test('已接通的五款目录产品均返回创作编号，其他目录编号不冒充创作编号', async () => {
+  for (const model of models.filter((m) => m.ready)) {
+    const id = `catalog:${model.id}`;
+    let calls = 0;
+    const deps = {
+      ...service(),
+      loadCatalog: async () => [{ id, name: model.name, category: '电脑', level: 'full', creativeModelId: model.id }],
+      loadCatalogEvidence: async () => [ev('F1', id)],
+      generate: async () => ++calls === 1 ? { candidateIds: [id] } : data([rec(id, ['F1'])]),
+    };
+    const answer = await consult(ask('想了解这个产品能否满足工作需要'), deps);
+    assert.equal(answer.recommendations[0].modelId, id);
+    assert.equal(answer.recommendations[0].creativeModelId, model.id);
+  }
 });

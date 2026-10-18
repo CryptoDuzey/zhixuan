@@ -6,6 +6,7 @@ import './consult.css';
 
 type Turn = { question: string; answer?: ConsultAnswer };
 const STARTERS = [
+  '知识库里有哪些产品？按类别给我看看完整目录',
   '大学学习，预算 6000 左右，主要用 Office，怎么选？',
   '经常出差，要开会和做文档，想先了解选购思路',
   '需要用 CAD 和专业插件，选电脑前该核实什么？',
@@ -91,8 +92,8 @@ export default function ConsultPage() {
         {!turns.length ? (
           <section className="consult-welcome" aria-labelledby="consult-title">
             <span className="consult-eyebrow">从你的日常出发</span>
-            <h1 id="consult-title">先聊需求，再选电脑。</h1>
-            <p>用来做什么，预算多少，哪些软件离不开？<br />把事情说清楚，我们一起找到合适的方案。</p>
+            <h1 id="consult-title">先聊需求，再选产品。</h1>
+            <p>电脑、显示器、打印机或配件，从实际用途说起。<br />把事情说清楚，我们一起找到合适的方案。</p>
             <div className="consult-prompts" aria-label="试着从这里开始">
               {STARTERS.map((starter) => <button type="button" key={starter} onClick={() => { setInput(starter); field.current?.focus(); }}>{starter}<span aria-hidden="true">↗</span></button>)}
             </div>
@@ -152,7 +153,9 @@ export default function ConsultPage() {
           </section>
         )}
         <div className="consult-bottom">
-          {selected && <div className="consult-handoff"><span>已选 · {selected.modelName}</span><a href={`/?${new URLSearchParams({ product: selected.modelId, scene })}`}>带到创作端 <span aria-hidden="true">↗</span></a></div>}
+          {selected && <div className="consult-handoff"><span>已选 · {selected.modelName}</span>{selected.creativeModelId
+            ? <a href={`/?${new URLSearchParams({ product: selected.creativeModelId, scene })}`}>带到创作端 <span aria-hidden="true">↗</span></a>
+            : <span>可继续咨询 · 图文素材尚未接通</span>}</div>}
           <form className="composer consult-composer" onSubmit={(event) => {
             event.preventDefault();
             send(input, lastFailed && input.trim() === turns.at(-1)!.question);
