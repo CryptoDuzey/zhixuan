@@ -12,6 +12,11 @@ import { createHash } from 'node:crypto';
 const script = fileURLToPath(new URL('./knowledge-server.mjs', import.meta.url));
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const image = Buffer.from('89504e470d0a1a0a0000000049454e44ae426082', 'hex');
+const verifiedSnapshot = (binding, extra = {}) => ({
+  service: 'ima-local-rag', apiVersion: 2, ready: true, indexStale: false,
+  files: binding.files, fingerprint: binding.indexFingerprint,
+  verification: 'full-content-per-request', ...extra,
+});
 
 async function temporary(t) {
   const dir = await mkdtemp(path.join(tmpdir(), 'zhixuan-adapter-test-'));
@@ -300,6 +305,7 @@ test('混合检索绑定全库指纹，并核对每条结果的真实原文', as
     const quote = entry.preview;
     const claim = mutate === 'claim' ? 'invented-fact-with-a-real-citation' : quote;
     res.end(JSON.stringify({
+      verifiedSnapshot: verifiedSnapshot(binding, mutate === 'binding' ? { fingerprint: 'other-library' } : {}),
       strategy: 'hybrid', indexFingerprint: binding.indexFingerprint, onlineUsed: false,
       totalCandidates: binding.files, results: [entry], returned: 1,
       ...(answer ? {
@@ -375,6 +381,7 @@ test('混合片段与短答统一指向原文字符位置，兼容换行和非BM
     const entry = { ...doc, start, end, preview: characters.slice(start, end).join(''), number: 1, citationId: 1 };
     const quote = entry.preview.trim();
     res.end(JSON.stringify({
+      verifiedSnapshot: verifiedSnapshot(binding),
       strategy, indexFingerprint: binding.indexFingerprint, onlineUsed: false,
       totalCandidates: binding.files, returned: 1, results: [entry],
       ...(answer ? {
@@ -415,17 +422,19 @@ test('混合检索并发有上限，繁忙与上游故障清楚返回且能够�
     service: 'ima-local-rag', ready: true, indexStale: false,
     files: binding.files, fingerprint: binding.indexFingerprint,
   });
+  const search = () => ({
+    verifiedSnapshot: verifiedSnapshot(binding),
+    strategy: 'hybrid', indexFingerprint: binding.indexFingerprint, onlineUsed: false,
+    totalCandidates: binding.files, results: [], returned: 0,
+  });
   const backend = createHttpServer((req, res) => {
     res.setHeader('content-type', 'application/json');
+    if (hold) { held.push({ res, probe: req.url === '/health' }); return; }
     if (req.url === '/health') {
-      if (hold) { held.push(res); return; }
       return res.end(JSON.stringify(health()));
     }
     if (fail) return res.end('private-upstream-error-do-not-reflect');
-    res.end(JSON.stringify({
-      strategy: 'hybrid', indexFingerprint: binding.indexFingerprint, onlineUsed: false,
-      totalCandidates: binding.files, results: [], returned: 0,
-    }));
+    res.end(JSON.stringify(search()));
   });
   await new Promise((resolve) => backend.listen(0, '127.0.0.1', resolve));
   t.after(() => { backend.closeAllConnections(); return new Promise((resolve) => backend.close(resolve)); });
@@ -456,7 +465,7 @@ test('混合检索并发有上限，繁忙与上游故障清楚返回且能够�
   assert.equal(held.length, 9, 'health probe has a slot separate from queries');
   assert.equal((await get('/rag/health')).status, 503, 'health probes also have a bound');
   hold = false;
-  for (const res of held) res.end(JSON.stringify(health()));
+  for (const { res, probe } of held) res.end(JSON.stringify(probe ? health() : search()));
   assert.equal((await probeCompleted)[0].value.status, 200);
   for (const result of await completed) {
     assert.equal(result.status, 'fulfilled');
@@ -484,6 +493,7 @@ async function ragFixture(t, env = {}, extra) {
       files: state.binding.files, fingerprint: state.binding.indexFingerprint, ...state.healthExtra,
     }));
     res.end(JSON.stringify({
+      verifiedSnapshot: verifiedSnapshot(state.binding),
       strategy: 'hybrid', indexFingerprint: state.binding.indexFingerprint, onlineUsed: false,
       totalCandidates: state.binding.files, returned: state.results.length, results: state.results, ...state.resultExtra,
     }));
@@ -504,6 +514,51 @@ async function until(predicate, label) {
   }
   assert.fail(`timed out waiting for ${label}`);
 }
+
+test('每次查询直接验证本次全库绑定，不预先重复健康全扫；旧响应及错误绑定均拒绝', async (t) => {
+  const { get, state } = await ragFixture(t);
+  for (const route of ['/rag/search?q=test&top_k=50', '/rag/search?q=absent&strategy=exact']) {
+    state.resultExtra = { strategy: route.includes('exact') ? 'exact' : 'hybrid' };
+    const response = await get(route);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.verifiedSnapshot, verifiedSnapshot(state.binding));
+    assert.deepEqual(body.results, []);
+  }
+  assert.equal(state.calls.length, 2, 'one upstream request per query, including empty results');
+  assert.ok(state.calls.every((call) => call.url.startsWith('/search?')));
+  state.resultExtra = {};
+  for (const [binding, status, reason] of [
+    [undefined, 502, 'UPSTREAM_INVALID_RESPONSE'],
+    [null, 502, 'UPSTREAM_INVALID_RESPONSE'],
+    [verifiedSnapshot(state.binding, { service: 'other-service' }), 502, 'UPSTREAM_INVALID_RESPONSE'],
+    [verifiedSnapshot(state.binding, { apiVersion: 1 }), 502, 'UPSTREAM_INVALID_RESPONSE'],
+    [verifiedSnapshot(state.binding, { verification: 'cached' }), 502, 'UPSTREAM_INVALID_RESPONSE'],
+    [verifiedSnapshot(state.binding, { indexStale: undefined }), 502, 'UPSTREAM_INVALID_RESPONSE'],
+    [verifiedSnapshot(state.binding, { files: String(state.binding.files) }), 409, 'RAG_INDEX_MISMATCH'],
+    [verifiedSnapshot(state.binding, { fingerprint: 'other-library' }), 409, 'RAG_INDEX_MISMATCH'],
+    [verifiedSnapshot(state.binding, { indexStale: true }), 409, 'RAG_INDEX_MISMATCH'],
+    [verifiedSnapshot(state.binding, { ready: false }), 503, 'RAG_NOT_READY'],
+  ]) {
+    state.resultExtra = { verifiedSnapshot: binding };
+    const response = await get('/rag/search?q=test');
+    assert.equal(response.status, status);
+    const body = await response.json();
+    assert.equal(body.reasonCode, reason);
+    assert.deepEqual(body.results, []);
+  }
+  for (const status of ['answered', 'clarify', 'insufficient_evidence']) {
+    state.resultExtra = {
+      status, answer: '需要更多依据。', citations: [], claims: [], conditions: [], evidenceSufficient: false,
+      verifiedSnapshot: verifiedSnapshot(state.binding, { fingerprint: 'other-library' }),
+    };
+    assert.equal((await get('/rag/answer?q=test')).status, 409, status);
+  }
+  state.resultExtra = {};
+  assert.equal((await get('/rag/search?q=test')).status, 200);
+  assert.equal((await get('/rag/health')).status, 200);
+  assert.equal(state.calls.filter((call) => call.url === '/health').length, 1);
+});
 
 function rawGet(base, route, headers = {}, data) {
   return new Promise((resolve, reject) => {
@@ -694,7 +749,7 @@ test('健康探测、查询响应头和流式正文均受总超时约束，超�
       return true;
     };
     const started = performance.now();
-    const response = await get('/rag/search?q=test');
+    const response = await get(phase === 'health' ? '/rag/health' : '/rag/search?q=test');
     assert.equal(response.status, 504, phase);
     const body = await response.json();
     assert.equal(body.reasonCode, 'UPSTREAM_TIMEOUT');
@@ -956,6 +1011,7 @@ test('1000字中文和非BMP问题均完整转发，1001字符在适配器拒绝
     if (req.url === '/health' || !req.url.startsWith('/answer?')) return false;
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({
+      verifiedSnapshot: verifiedSnapshot(state.binding),
       strategy: 'hybrid', indexFingerprint: state.binding.indexFingerprint, onlineUsed: false,
       totalCandidates: state.binding.files, returned: 0, results: [], citations: [], claims: [],
       status: 'insufficient_evidence', answer: '资料不足。', evidenceSufficient: false, conditions: [],

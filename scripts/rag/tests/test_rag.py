@@ -636,6 +636,11 @@ class PipelineTests(OfflineCase):
             result = engine.search("苹果", 2, strategy)
             self.assertEqual(result["strategy"], strategy)
             self.assertEqual(result["indexFingerprint"], manifest["fingerprint"])
+            self.assertEqual(result["verifiedSnapshot"], {
+                "service": "ima-local-rag", "apiVersion": 2, "files": 3,
+                "fingerprint": manifest["fingerprint"], "ready": True,
+                "indexStale": False, "verification": "full-content-per-request",
+            })
             self.assertFalse(result["onlineUsed"])
             self.assertLessEqual(result["returned"], 2)
             self.assertEqual(result["results"][0]["path"], "苹果说明.markdown")
@@ -647,6 +652,32 @@ class PipelineTests(OfflineCase):
         self.assertEqual(health["fingerprint"], manifest["fingerprint"])
         self.assertTrue(health["ready"])
         self.assertFalse(health["indexStale"])
+
+    def test_query_and_answer_each_verify_full_snapshot_once_and_detect_changes(self):
+        self.write("P1-产品参数库/06-型号检索卡/HUAWEI MateBook Pro S/核心硬件卡.md",
+                   "# 虚构离线资料\n\n## 已确认事实\n\n- 内存7 GB，仅用于虚构测试。\n")
+        manifest = self.build()
+        engine = self.engine()
+        self.addCleanup(engine.vectors._mmap.close)
+        with patch.object(engine, "verify_snapshot", wraps=engine.verify_snapshot) as verify:
+            empty = engine.search("不存在的字面词", 50, "exact")
+            self.assertEqual(empty["results"], [])
+            self.assertEqual(empty["verifiedSnapshot"]["files"], 4)
+            self.assertEqual(verify.call_count, 1)
+            for q, status in [("ProS内存多大", "answered"), ("MateBook14内存", "clarify"),
+                              ("今天多少钱", "insufficient_evidence")]:
+                with self.subTest(query=q):
+                    verify.reset_mock()
+                    out = engine.answer(q)
+                    self.assertEqual(out["status"], status)
+                    self.assertEqual(out["verifiedSnapshot"]["fingerprint"], manifest["fingerprint"])
+                    self.assertEqual(verify.call_count, 1)
+        # Even a binary source not returned by the query participates in validation.
+        self.write("picture.bin", b"\x01\xff")
+        with self.assertRaises(CorpusChanged):
+            engine.search("不存在的字面词", 50, "exact")
+        with self.assertRaises(CorpusChanged):
+            engine.answer("ProS内存多大")
 
     def test_tampered_metadata_and_vectors_cannot_load(self):
         self.build()

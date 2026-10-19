@@ -369,7 +369,14 @@ async function start() {
     }
     if (probeOnly) ragProbes++; else ragActive++;
     try {
-      const health = await upstream('/health', signal, requestId, MAX_HEALTH_BYTES);
+      // Every query carries its own full-content verification binding. An
+      // explicit health probe still performs an independent full verification.
+      const body = probeOnly ? null : await upstream(`${route}${url.search}`, signal, requestId, upstreamMaxBytes);
+      const health = probeOnly ? await upstream('/health', signal, requestId, MAX_HEALTH_BYTES) : body.verifiedSnapshot;
+      if (!health || (!probeOnly && (health.apiVersion !== 2
+        || health.verification !== 'full-content-per-request' || typeof health.indexStale !== 'boolean'))) {
+        throw new KnowledgeError(502, 'UPSTREAM_INVALID_RESPONSE', '混合检索缺少本次资料核验信息。', 'upstream');
+      }
       if (health.service !== 'ima-local-rag') throw new KnowledgeError(502, 'UPSTREAM_INVALID_RESPONSE', '混合检索返回了无效健康信息。', 'upstream');
       if (health.files !== files.size || health.fingerprint !== fingerprint || health.indexStale || indexStale) {
         throw new KnowledgeError(409, 'RAG_INDEX_MISMATCH', '混合检索索引与当前资料不一致，请核对并更新索引。', 'upstream');
@@ -380,7 +387,6 @@ async function start() {
         ...pick(health, ['service', 'status', 'files', 'textFiles', 'chunks', 'fingerprint', 'ready', 'indexStale', 'apiVersion', 'uptimeSeconds']),
         requestId, adapterIndexFingerprint: fingerprint, semanticRecallGuaranteed: false, probeScope: 'snapshot-and-query-service',
       });
-      const body = await upstream(`${route}${url.search}`, signal, requestId, upstreamMaxBytes);
       if (body.strategy !== strategy || body.indexFingerprint !== fingerprint
         || !Array.isArray(body.results) || body.onlineUsed !== false
         || body.results.length > (route === '/search' ? topK : 200)
@@ -439,6 +445,7 @@ async function start() {
           'evidenceSufficient', 'schemaVersion', 'status', 'reasonCode', 'answerType', 'answer', 'abstained', 'claims',
           'conditions', 'dataAsOf', 'clarification', 'warnings', 'generationModelUsed', 'sourceKind', 'missingFields', 'applicableTo']),
         onlineUsed: false, semanticRecallGuaranteed: false, answerCorrectnessGuaranteed: false,
+        verifiedSnapshot: pick(health, ['service', 'apiVersion', 'files', 'fingerprint', 'ready', 'indexStale', 'verification']),
         results, ...(route === '/answer' ? { citations } : {}),
         requestId, source: SOURCE, retrievalScope: 'all-indexed-documents', scannedLocalFiles: files.size, items: results,
         ...(route === '/search' ? {

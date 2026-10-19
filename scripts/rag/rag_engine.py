@@ -463,6 +463,14 @@ class Engine:
         return {"query": q, "strategy": strategy, "analysis": a, "results": results,
                 "totalCandidates": count, "returned": len(results), "latencyMs": round((time.perf_counter()-start)*1000, 2),
                 "model": self.manifest["model"], "indexFingerprint": self.manifest["fingerprint"],
+                # search() has verified every source byte for this request. The
+                # adapter can validate this binding without a second full scan.
+                "verifiedSnapshot": {
+                    "service": "ima-local-rag", "apiVersion": 2,
+                    "files": self.manifest["files"], "fingerprint": self.manifest["fingerprint"],
+                    "ready": not self.index_stale, "indexStale": self.index_stale,
+                    "verification": "full-content-per-request",
+                },
                 "onlineUsed": False, "semanticRecallGuaranteed": False, "evidenceSufficient": False}
 
     def answer(self, q, top_k=5):
