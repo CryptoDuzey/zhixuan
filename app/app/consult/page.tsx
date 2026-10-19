@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Recommendation } from '../../lib/consult.ts';
 import type { RetrievalSummary } from '../../lib/retrieval.ts';
+import ModelSettings from '../components/ModelSettings';
 import {
   browserStorage, CONSULT_MAX_TURNS, CONSULT_SESSION_KEY, CONSULT_ID_KEY, decodeConsultSession,
   parseConsultAnswer, parseConsultSnapshot, consultRunText, newStudioId, validStudioId,
@@ -10,6 +11,7 @@ import {
 } from '../components/frontend-session.ts';
 import { consumeAgentStream, parseAgentRun, type AgentRun } from '../../lib/agent-stream.ts';
 import './consult.css';
+import { HANDOFF_PLATFORMS, handoffStorage, saveHandoff, handoffMessage, type CreativeHandoff, type HandoffPlatform } from '../components/frontend-handoff.ts';
 
 const STARTERS = [
   '知识库里有哪些产品？按类别给我看看完整目录',
@@ -55,6 +57,17 @@ export default function ConsultPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<Recommendation | null>(null);
+  const [settings, setSettings] = useState(false);
+  const [handoffOpen, setHandoffOpen] = useState(false);
+  const [handoffQuestions, setHandoffQuestions] = useState<string[]>([]);
+  const [included, setIncluded] = useState<number[]>([]);
+  const [handoffTask, setHandoffTask] = useState('');
+  const [audience, setAudience] = useState('');
+  const [constraints, setConstraints] = useState('');
+  const [platform, setPlatform] = useState<HandoffPlatform | ''>('');
+  const [handoffError, setHandoffError] = useState('');
+  const [fallbackText, setFallbackText] = useState('');
+  const [modelProgress, setModelProgress] = useState<{ callId: string; characters: number; mode: string } | null>(null);
   const pending = useRef(false);
   const requests = useRef(new SessionEpoch());
   const sid = useRef('');
@@ -70,11 +83,41 @@ export default function ConsultPage() {
   const [tools, setTools] = useState<{ tool: string; label: string; status: string; cacheHit?: boolean }[]>([]);
   const end = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLTextAreaElement>(null);
-  const scene = turns.map((t) => t.question).join('；').slice(-160);
+  function choose(rec: Recommendation, index: number) {
+    if (selected === rec) { setSelected(null); setHandoffOpen(false); return; }
+    setSelected(rec);
+    const questions = turns.slice(0, index + 1).map((turn) => turn.question);
+    setHandoffQuestions(questions);
+    setIncluded([index]);
+    setHandoffTask(questions[index] || '');
+    setAudience('');
+    setConstraints('');
+    setHandoffError('');
+    setFallbackText('');
+    setHandoffOpen(false);
+  }
+  function beginCreation() {
+    if (!selected?.creativeModelId || !handoffTask.trim() || !platform) return;
+    const value: CreativeHandoff = { version: 1, token: newStudioId(), createdAt: Date.now(),
+      productId: selected.creativeModelId, task: handoffTask.trim(), audience: audience.trim(),
+      constraints: constraints.trim(), platform };
+    if (!saveHandoff(handoffStorage(), value)) {
+      setHandoffError('浏览器未能暂存需求，尚未跳转。可重试，或复制下方需求，再进入创作粘贴发送。');
+      setFallbackText(`本轮产品选择：${selected.modelName || selected.modelId}。\n${handoffMessage(value)}`);
+      return;
+    }
+    window.location.assign(`/?handoff=${encodeURIComponent(value.token)}`);
+  }
 
   useEffect(() => {
     end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [turns, busy, error]);
+  useEffect(() => {
+    if (!handoffOpen) return;
+    const previous = document.documentElement.style.overflow;
+    document.documentElement.style.overflow = 'hidden';
+    return () => { document.documentElement.style.overflow = previous; };
+  }, [handoffOpen]);
   useEffect(() => {
     const storedId = readStorage(browserStorage(), CONSULT_ID_KEY);
     if (validStudioId(storedId.value)) {
@@ -105,12 +148,14 @@ export default function ConsultPage() {
     }
   }
   async function recover() {
+    setModelProgress(null);
     clearTimeout(timer.current);
     const task = requests.current.start();
     pending.current = true;
     setRecovering(true);
     setRecoveryError('');
     setSelected(null);
+    setHandoffOpen(false);
     async function poll() {
       try {
         const response = await fetch(`/api/consult?sessionId=${encodeURIComponent(sid.current)}`, {
@@ -176,6 +221,7 @@ export default function ConsultPage() {
     pending.current = true;
     saveId();
     setBusy(true);
+    setModelProgress(null);
     setRun(undefined);
     setTools([]);
     setStopping(false);
@@ -184,6 +230,7 @@ export default function ConsultPage() {
     setRecoveryError('');
     setSessionNote('');
     setSelected(null);
+    setHandoffOpen(false);
     setInput('');
     if (!retry) saveTurns([...turnsRef.current, { question }]);
     let streamError = '';
@@ -215,9 +262,16 @@ export default function ConsultPage() {
       }
       await consumeAgentStream(response, (event) => {
         if (!task.current()) return;
+        if (!cancelPending.current && event.type === 'model_progress' && typeof event.callId === 'string' && event.callId.length <= 200
+          && Number.isSafeInteger(event.characters) && (event.characters as number) >= 0
+          && (event.mode === 'stream' || event.mode === 'buffered')) {
+          setModelProgress({ callId: event.callId, characters: event.characters as number, mode: event.mode });
+        }
+        if (event.type === 'error' || event.type === 'done') setModelProgress(null);
         const state = parseAgentRun(event.run);
         if (state) setRun(state);
         if (event.type === 'step' && typeof event.label === 'string') {
+          setModelProgress(null);
           setRun((previous) => previous ? { ...previous, phase: event.label as string } : previous);
         }
         if (event.type === 'tool' && ['model', 'knowledge'].includes(String(event.tool))
@@ -252,6 +306,7 @@ export default function ConsultPage() {
     const stoppedId = sid.current;
     const stoppedGeneration = generation.current;
     cancelPending.current = true;
+    setModelProgress(null);
     setStopping(true);
     try {
       const response = await fetch('/api/consult/cancel', {
@@ -276,6 +331,7 @@ export default function ConsultPage() {
     pending.current = false;
     cancelPending.current = false;
     setBusy(false);
+    setModelProgress(null);
     setStopping(false);
     setRecovering(false);
     setRecoveryError('');
@@ -284,6 +340,7 @@ export default function ConsultPage() {
     setTools([]);
     saveTurns([]);
     setSelected(null);
+    setHandoffOpen(false);
     setError('');
     setInput('');
     setSessionNote('已开启新咨询，说说这次的用途和预算。');
@@ -303,8 +360,10 @@ export default function ConsultPage() {
         </nav>
         <div className="top-right">
           <button type="button" onClick={reset} disabled={!hydrated}>新咨询</button>
+          <button type="button" className="settings-trigger" disabled={busy} onClick={() => setSettings(true)}>模型设置</button>
         </div>
       </header>
+      {settings && <ModelSettings onClose={() => setSettings(false)} />}
       <main className={`consult-main${turns.length ? ' consult-started' : ''}`}>
         <div className="session-status" aria-live="polite">
           {!hydrated || recovering ? <p role="status">正在恢复咨询记录…</p> : null}
@@ -342,7 +401,7 @@ export default function ConsultPage() {
                           const active = selected === rec;
                           return (
                             <article className={`consult-card${active ? ' is-selected' : ''}`} key={rec.modelId}>
-                              <button className="consult-select" type="button" aria-pressed={active} onClick={() => setSelected(active ? null : rec)}>
+                              <button className="consult-select" type="button" disabled={busy || recovering} aria-pressed={active} onClick={() => choose(rec, index)}>
                                 <span><span className="consult-system">{rec.system}</span><strong>{rec.modelName || rec.modelId}</strong></span>
                                 <span className="consult-check" aria-hidden="true">{active ? '✓' : '+'}</span>
                               </button>
@@ -376,6 +435,8 @@ export default function ConsultPage() {
               <span>{stopping ? '正在停止咨询，请等待确认' : run ? consultRunText(run) : '正在核对资料，整理适合你的方案…'}</span>
               {run?.status === 'running' && <button type="button" disabled={stopping} onClick={stop}>{stopping ? '等待确认' : '停止咨询'}</button>}
             </div>}
+            {busy && modelProgress && <p className="consult-status" role="status">{modelProgress.mode === 'stream'
+              ? `正在生成 · 已接收 ${modelProgress.characters} 字（尚未完成）` : '正在等待完整模型回复（尚未完成）'}</p>}
             {tools.length > 0 && <ul className="consult-tools">{tools.map((tool, i) => <li key={i}>
               <span>{tool.tool === 'model' ? '模型' : '资料'} · {tool.label}</span>
               <span>{tool.status === 'started' ? busy ? '进行中' : '结果未确认' : tool.status === 'failed' ? '调用失败' : '已返回'}{tool.status === 'completed' && tool.cacheHit ? ' · 使用缓存' : ''}</span>
@@ -386,7 +447,7 @@ export default function ConsultPage() {
         )}
         <div className="consult-bottom">
           {selected && <div className="consult-handoff"><span>已选 · {selected.modelName}</span>{selected.creativeModelId
-            ? <a href={`/?${new URLSearchParams({ product: selected.creativeModelId, scene })}`}>开启新创作 <span aria-hidden="true">↗</span></a>
+            ? <button type="button" onClick={() => setHandoffOpen(true)}>确认创作需求 ↗</button>
             : <span>可继续咨询 · 图文素材尚未接通</span>}</div>}
           <form className="composer consult-composer" onSubmit={(event) => {
             event.preventDefault();
@@ -407,6 +468,35 @@ export default function ConsultPage() {
           <p className="consult-note">保留最近 12 轮咨询 · 选定产品后开启独立创作<br />依据本地资料提供建议 · 软件兼容需核实 · 价格均为历史快照</p>
         </div>
       </main>
+      {handoffOpen && selected && <div className="handoff-backdrop" onClick={() => setHandoffOpen(false)}>
+        <section className="handoff-dialog" role="dialog" aria-modal="true" aria-labelledby="handoff-title" onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') setHandoffOpen(false);
+            if (event.key === 'Tab') {
+              const items = event.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), input, textarea, select, a[href]');
+              const first = items[0], last = items[items.length - 1];
+              if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+              else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+            }
+          }}>
+          <div className="handoff-head"><h2 id="handoff-title">把需求交给创作</h2><button autoFocus type="button" onClick={() => setHandoffOpen(false)}>返回咨询</button></div>
+          <p>已选 {selected.modelName}。将开启独立创作，发送前仍可修改。产品信息会重新查证。</p>
+          <fieldset><legend>带入哪些用户提问</legend><p>默认只带入该推荐对应的提问；可勾选相关的前文。勾选后会重新填入任务，请再编辑确认。</p>
+            {handoffQuestions.map((question, index) => <label className="handoff-question" key={index}><input type="checkbox" checked={included.includes(index)}
+              onChange={(event) => {
+                const next = event.target.checked ? [...included, index].sort((a, b) => a - b) : included.filter((item) => item !== index);
+                setIncluded(next); setHandoffTask(next.map((item) => handoffQuestions[item]).join('\n\n'));
+              }} /><span>{question}</span></label>)}
+          </fieldset>
+          <label className="handoff-field">任务与使用需求 <span>{handoffTask.length} / 24000</span><textarea rows={5} maxLength={24000} value={handoffTask} onChange={(event) => setHandoffTask(event.target.value)} /></label>
+          <label className="handoff-field">目标受众<textarea rows={2} maxLength={1000} placeholder="例如：经常出差的职场新人" value={audience} onChange={(event) => setAudience(event.target.value)} /></label>
+          <label className="handoff-field">硬约束<textarea rows={2} maxLength={2000} placeholder="例如：预算上限、必需软件、不能夸大的结论" value={constraints} onChange={(event) => setConstraints(event.target.value)} /></label>
+          <label className="handoff-field">发布平台<select value={platform} onChange={(event) => setPlatform(event.target.value as HandoffPlatform | '')}><option value="">请选择发布平台</option>{HANDOFF_PLATFORMS.map((item) => <option key={item}>{item}</option>)}</select></label>
+          <p className="handoff-privacy">仅交接上方确认的需求和产品选择，不带入助手回复。需求不写入网址，暂存 30 分钟，打开创作后即清除。</p>
+          {handoffError && <div role="alert"><p>{handoffError}</p><label className="handoff-field">可复制的创作需求<textarea readOnly rows={5} value={fallbackText} onFocus={(event) => event.target.select()} /></label><a href={`/?product=${encodeURIComponent(selected.creativeModelId || '')}`}>进入创作，手动粘贴需求 ↗</a></div>}
+          <button className="handoff-confirm" type="button" disabled={!handoffTask.trim() || !platform} onClick={beginCreation}>确认并开启独立创作</button>
+        </section>
+      </div>}
     </div>
   );
 }

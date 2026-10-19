@@ -261,3 +261,33 @@ test('LLM failure logs never store raw network errors or gateway bodies', async 
   assert.ok(!JSON.stringify(getLlmCalls()).includes('offline-server-key'));
   assert.ok(!JSON.stringify(getLlmCalls()).includes('secret upstream'));
 });
+
+test('quota failures stop after one call and expose only an actionable safe message', async (t) => {
+  const transport = t.mock.method(globalThis, 'fetch', async () => Response.json({
+    error: { code: 'pre_consume_token_quota_failed', message: '令牌[offline-server-key]额度不足 secret upstream' },
+  }, { status: 403 }));
+  await assert.rejects(chat([{ role: 'user', content: '实际产品问题' }], { purpose: 'quota test' }),
+    (error: Error & { code?: string; status?: number }) => {
+      assert.equal(error.status, 403);
+      assert.equal(error.code, 'quota_exhausted');
+      assert.match(error.message, /额度不足.*模型设置/);
+      assert.doesNotMatch(error.message, /offline-server-key|secret upstream/);
+      return true;
+    });
+  assert.equal(transport.mock.callCount(), 1);
+  assert.equal(getLlmCalls().length, 1);
+  assert.doesNotMatch(JSON.stringify(getLlmCalls()), /offline-server-key|secret upstream/);
+});
+
+test('model permission rejection advances without retrying the same model', async (t) => {
+  const attempted: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    const model = JSON.parse(String(init?.body)).model;
+    attempted.push(model);
+    return model === 'fallback-a' ? Response.json({ error: { code: 'model_not_allowed' } }, { status: 403 })
+      : Response.json({ choices: [{ message: { content: 'allowed model reply' } }] });
+  });
+  const result = await chat([{ role: 'user', content: 'hello' }], { purpose: 'permission test' });
+  assert.equal(result.model, 'fallback-b');
+  assert.deepEqual(attempted, ['fallback-a', 'fallback-b']);
+});

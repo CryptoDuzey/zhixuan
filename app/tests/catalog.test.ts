@@ -4,7 +4,7 @@ import { createCatalog } from '../lib/catalog.ts';
 import type { LocalDoc, ReadResult } from '../lib/ima.ts';
 import type { ModelEntry } from '../lib/facts.ts';
 
-function fixture(models: ModelEntry[] = []) {
+function fixture(models: ModelEntry[] = [], beforeRead?: (doc: LocalDoc) => Promise<void>) {
   const index: LocalDoc[] = [];
   const texts = new Map<string, string>();
   const reads: string[] = [];
@@ -16,6 +16,7 @@ function fixture(models: ModelEntry[] = []) {
     models, loadLocalIndex: async () => index,
     readLocalText: async (doc): Promise<ReadResult> => {
       reads.push(doc.id);
+      await beforeRead?.(doc);
       return { ok: texts.has(doc.id), text: texts.get(doc.id), source: '本地已下载知识库', readAt: '2026-10-18T00:00:00Z' };
     },
   });
@@ -146,4 +147,41 @@ test('读取失败或缺少限制明确报错，恢复后可重试，不能伪�
   const missing = fixture();
   missing.add('fact', `${fullPath('新品')}产品事实.md`, '# 新品 - 产品事实\n真实正文');
   await assert.rejects(missing.loadCatalog(), /缺少完整型号限制/);
+});
+
+test('55张发现卡及完整资料按最多4个并发读取，同时请求目录复用同一次构建', async () => {
+  let active = 0;
+  let peak = 0;
+  const phasePeaks = { fact: 0, limit: 0, card: 0 };
+  const f = fixture([], async (doc) => {
+    const phase = doc.id.endsWith('-fact') ? 'fact' : doc.id.endsWith('-limit') ? 'limit' : 'card';
+    active++;
+    peak = Math.max(peak, active);
+    phasePeaks[phase] = Math.max(phasePeaks[phase], active);
+    try {
+      // Yield while the read is in flight, so an unbounded Promise.all would
+      // reproduce the knowledge service's eight-connection failure.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.ok(active <= 8, 'the knowledge service rejects more than eight active reads');
+    } finally {
+      active--;
+    }
+  });
+  for (let i = 0; i < 11; i++) full(f, `full-${i}`, `完整型号${i}款`);
+  for (let i = 1; i <= 55; i++) f.add(`card-${i}`, cardPath(`发现设备${i}款`, i), `# 发现设备${i}款\n- 产品类别：显示器`);
+  const [first, second, third] = await Promise.all([f.loadCatalog(), f.loadCatalog(), f.loadCatalog()]);
+  assert.equal(first.length, 66);
+  assert.deepEqual(second, first);
+  assert.deepEqual(third, first);
+  assert.equal(first.filter((entry) => entry.level === 'discovery').length, 55);
+  assert.equal(first.filter((entry) => entry.level === 'full').length, 11);
+  assert.equal(active, 0);
+  assert.equal(peak, 4);
+  assert.deepEqual(phasePeaks, { fact: 4, limit: 4, card: 4 });
+  assert.equal(f.reads.length, 77);
+  assert.equal(new Set(f.reads).size, 77);
+  const evidence = await f.loadCatalogEvidence('catalog:card-55');
+  assert.ok(evidence.length > 0);
+  assert.ok(evidence.every((e) => e.docId === 'card-55' && e.kind === 'limit'));
+  assert.equal(f.reads.length, 77, 'cached evidence must not start another document read');
 });

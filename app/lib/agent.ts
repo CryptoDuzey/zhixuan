@@ -4,6 +4,9 @@ import { chatJson } from './llm.ts';
 import { PLATFORM_SPEC, REQUIRED_FOOTER, SYSTEM_PROMPT } from './prompts.ts';
 import { loadEvidence, loadImages, MODELS, type Evidence, type ImageRef, type ModelEntry } from './facts.ts';
 import { IMAGE_RANGE, mergeReports, runDeterministicChecks, type CheckReport, type Draft, type Issue, type Platform } from './check.ts';
+import { loadCatalog, type CatalogEntry } from './catalog.ts';
+import { answerConversation, createConversationSources, planConversation, UNCONFIRMED_PRODUCT } from './agent-conversation.ts';
+import { throwIfStopped } from './agent-runtime.ts';
 
 export interface NeedCard {
   intent: 'create' | 'revise' | 'chat';
@@ -32,11 +35,12 @@ export const SNAPSHOT_DATE = '2026-10-17';
 const PLATFORMS: Platform[] = ['公众号', '小红书', '朋友圈'];
 const UNSUPPORTED = /(到手价|叠加补贴|补贴后|最后一天|今天最后|限时|最低价|全网最低|抢购|手慢无)/g;
 
-/** 可注入离线资料源；生产环境始终使用事实层的产品注册表。 */
+/** 可注入离线资料源；生产对话使用动态目录，旧注入源保持确定性守卫语义。 */
 export interface AgentSources {
   models: readonly ModelEntry[];
   loadEvidence: typeof loadEvidence;
   loadImages: typeof loadImages;
+  catalog?: readonly CatalogEntry[];
 }
 const DEFAULT_SOURCES: AgentSources = { models: MODELS, loadEvidence, loadImages };
 
@@ -63,6 +67,16 @@ const imgText = (list: ImageRef[]) =>
 const IMAGE_CAPTION_RULES = `图注规则：已人工看图复核的实际画面描述优先于索引类别、文件名及索引说明，图注不能与实际画面描述矛盾。
 未复核索引不能证明画面里的人物、动作、颜色或具体功能；即使图注照抄类别或索引说明，也不自动视为有依据。无法确认的画面内容须标为待确认，不得猜测。
 画面描述只能支持可见内容，不能证明产品功能、参数或效果；功能、参数、效果仍须有产品事实证据。`;
+
+function writingSystem(sources: AgentSources): string {
+  return sources.catalog
+    ? `${SYSTEM_PROMPT}
+
+# 本轮动态目录草稿
+本轮允许先交付文字草稿。图片清单不足是平台配图数量要求的例外：先完成文字，无图时 images=[]，不得凑图；配图不足由核验报告提示发布前补齐。
+产品发现卡或空证据只支持有边界的场景草稿，规格、价格及适配空缺明确待确认；不因缺资料停止所有文字创作。事实引用须原样保留完整 catalog:...:E... 编号。`
+    : SYSTEM_PROMPT;
+}
 
 /** 去重：被更长条目包含的短条目视为重复（如“到手价”与“叠加补贴到手价”）。 */
 export function dedupeByContainment(items: string[]): string[] {
@@ -136,7 +150,9 @@ ${IMAGE_CAPTION_RULES}
 ## 输出
 只输出一个 JSON 对象：
 {"title":"","lead":"","body":"","cta":"","tags":[],"images":[{"imageId":"IMG1","position":"导语后","caption":""}],"claims":[{"id":"C1","text":"稿件中的一个产品事实主张原句","factIds":["E001"]}]}
-claims 要覆盖正文里每一条产品事实（参数、功能、限制），factIds 只能用清单里的 E 编号。`;
+claims 要覆盖正文里每一条产品事实（参数、功能、限制），factIds 必须原样使用清单中的完整编号（包括 catalog: 前缀），不得缩写成 E001。
+图片清单不足时仍完成文字草稿，只选真实已有图片；无图时 images=[]，不得编造图片或跨型号补位。
+资料仅支持产品发现或尚无证据时，写有用的场景/需求草稿，明确标出待确认的规格及资料空缺，不把发现卡推断成参数或适配结论。`;
 }
 
 function toDraft(data: any, base: { version: number; platform: Platform; modelId: string; modelName: string }): Draft {
@@ -304,8 +320,12 @@ function selectModel(s: Session, id: string, name: string, preserveHistory = fal
   s.modelGuard = undefined;
 }
 
-/** 所有写作入口共用的确定性守卫，必须先于资料读取和模型调用。 */
+/** 旧注入源保留原守卫；动态目录由模型理解后选择精确产品。 */
 function guardModel(text: string, s: Session, emit: Emit, sources: AgentSources): boolean {
+  if (sources.catalog) {
+    s.modelGuard = undefined;
+    return false;
+  }
   const normalized = text.normalize('NFKC');
   const all = modelMentions(normalized);
   const mentions = all.filter((m) => !m.rejected);
@@ -375,7 +395,14 @@ function guardModel(text: string, s: Session, emit: Emit, sources: AgentSources)
 }
 
 /** 需求卡只能校验当前选择，不能反过来用旧需求切换产品。 */
-function guardNeed(need: NeedCard, s: Session, emit: Emit): boolean {
+function guardNeed(need: NeedCard, s: Session, emit: Emit, sources?: AgentSources): boolean {
+  // 动态产品已由路由选择精确目录 ID，不能再用五款正则把新产品误判为冲突。
+  if (sources?.catalog) {
+    if (!s.draft || s.draft.modelId === s.modelId) return false;
+    clearWork(s);
+    emit({ type: 'clarify', question: '产品已切换，请按当前产品继续创作。' });
+    return true;
+  }
   const text = [need.scene, need.audience, ...need.facts_from_user].filter(Boolean).join('\n').normalize('NFKC');
   const conflict = modelMentions(text).some((m) => !m.rejected && m.id !== s.modelId && !(m.id === 'mb14' && s.modelId.startsWith('mb14-')));
   if (!conflict && (!s.draft || s.draft.modelId === s.modelId)) return false;
@@ -429,7 +456,78 @@ function restrictDraftImages(d: Draft, images: ImageRef[]): Draft {
   };
 }
 
+/** 生产默认入口：模型先理解意图，目录提供产品边界，写作仍使用独立证据核验。 */
+async function handleCatalogMessage(text: string, s: Session, emit: Emit, history = ''): Promise<Session> {
+  emit({ type: 'step', label: '理解需求与查阅产品目录' });
+  const catalog = await loadCatalog();
+  const sources = createConversationSources(catalog);
+  s.modelGuard = undefined;
+  const conversation = [history, ...(s.modelHistory ?? [])].filter(Boolean).join('\n').slice(-6000);
+  const plan = await planConversation(text, conversation, s, catalog);
+  const need = plan.need;
+  need.unsupported_requests = dedupeByContainment([
+    ...need.unsupported_requests, ...new Set(text.match(UNSUPPORTED) ?? []),
+  ]);
+
+  if (need.intent === 'chat') {
+    const evidence: Evidence[] = [];
+    for (const id of plan.evidenceModelIds) evidence.push(...await sources.loadEvidence(id, { withRules: false }));
+    const reply = evidence.length || plan.evidenceModelIds.length || !plan.reply
+      ? await answerConversation(text, conversation, evidence, { modelId: plan.modelId, need: s.need, draft: s.draft })
+      : plan.reply;
+    remember(s, `用户：${text}`);
+    remember(s, `助手：${reply}`);
+    emit({ type: 'notice', text: reply });
+    return s;
+  }
+
+  if (need.next_action === 'clarify') {
+    // 指定版本不清时旧稿不得继续带着完成状态，但保留本次用途供短答续接。
+    const oldVersion = (s.draft?.version ?? 0);
+    clearWork(s);
+    s.modelId = '';
+    s.modelName = '';
+    remember(s, `用户：${text}`);
+    s.need = need;
+    emit({ type: 'need', need });
+    const question = need.question || plan.reply || '这次内容最想解决读者的哪个问题？';
+    remember(s, `助手：${question}${oldVersion ? '（旧稿已撤销）' : ''}`);
+    emit({ type: 'clarify', question });
+    return s;
+  }
+
+  const modelId = plan.modelId ?? UNCONFIRMED_PRODUCT;
+  const model = sources.models.find((item) => item.id === modelId)!;
+  const sameProduct = s.modelId === modelId && s.draft?.modelId === modelId;
+  const previousNeed = sameProduct ? s.need : undefined;
+  selectModel(s, modelId, model.name);
+  remember(s, `用户：${text}`);
+  const entry = catalog.find((item) => item.id === modelId);
+  if (!entry || entry.level === 'discovery') {
+    need.unknowns = [...new Set([...need.unknowns, '完整产品规格、配置、兼容性及限制资料待补充'])];
+    emit({ type: 'notice', text: '这款完整规格资料尚不齐全，先按已知资料写文字草稿；空缺会明确标注，参数不作推断。' });
+  }
+  const merged: NeedCard = {
+    ...need,
+    ...(previousNeed ? {
+      scene: need.scene || previousNeed.scene,
+      audience: need.audience || previousNeed.audience,
+      facts_from_user: [...new Set([...previousNeed.facts_from_user, ...need.facts_from_user])],
+      unknowns: [...new Set([...previousNeed.unknowns, ...need.unknowns])],
+      unsupported_requests: dedupeByContainment([...previousNeed.unsupported_requests, ...need.unsupported_requests]),
+    } : {}),
+  };
+  s.need = merged;
+  emit({ type: 'need', need: merged });
+  if (merged.unsupported_requests.length) emit({ type: 'notice', text: `没有资料依据，不会写进稿件：${merged.unsupported_requests.join('、')}` });
+  if (sameProduct && need.intent === 'revise' && s.draft && merged.platform === s.draft.platform) {
+    return reviseDraft(text, s, emit, sources);
+  }
+  return writeFromNeed(merged, text, s, emit, sources);
+}
+
 export async function createDraft(userText: string, s: Session, emit: Emit, _history = '', sources: AgentSources = DEFAULT_SOURCES): Promise<Session> {
+  if (sources === DEFAULT_SOURCES) return handleCatalogMessage(userText, s, emit, _history);
   if (guardModel(userText, s, emit, sources)) return s;
   emit({ type: 'step', label: '理解需求' });
   const need = await understandForSession(userText, s, sources);
@@ -447,6 +545,7 @@ export async function createDraft(userText: string, s: Session, emit: Emit, _his
 
 /** 根据需求卡取证据、写稿并核验。换平台/换场景时版本号延续，旧核验自动失效。 */
 export async function writeFromNeed(need: NeedCard, userText: string, s: Session, emit: Emit, sources: AgentSources = DEFAULT_SOURCES): Promise<Session> {
+  if (sources === DEFAULT_SOURCES) return handleCatalogMessage(userText, s, emit, JSON.stringify({ proposedNeed: need }));
   const previousModel = s.modelId;
   const previousNeed = s.need;
   if (guardModel(userText, s, emit, sources)) return s;
@@ -455,7 +554,7 @@ export async function writeFromNeed(need: NeedCard, userText: string, s: Session
     emit({ type: 'clarify', question: `已切换为 ${s.modelName}，请重新说明这款产品的平台、用途和受众。` });
     return s;
   }
-  if (guardNeed(need, s, emit)) return s;
+  if (guardNeed(need, s, emit, sources)) return s;
   remember(s, userText);
   const platform = need.platform;
   if (!platform || !PLATFORMS.includes(platform)) {
@@ -467,18 +566,29 @@ export async function writeFromNeed(need: NeedCard, userText: string, s: Session
   s.need = need;
   emit({ type: 'step', label: '核对产品资料', detail: model.name });
   const all = await sources.loadEvidence(model.id, { withRules: false });
-  const images = uniqueModelImages(await sources.loadImages(model.id), model.id);
+  let images: ImageRef[];
+  try {
+    images = uniqueModelImages(await sources.loadImages(model.id), model.id);
+  } catch (error) {
+    if (!sources.catalog) throw error;
+    // 缺图片索引不妨碍有证据的文字；取消和预算错误仍应传到任务层。
+    throwIfStopped();
+    images = [];
+    emit({ type: 'notice', text: '本型号图片暂时无法读取，先生成文字草稿，发布前需要补图。' });
+  }
   const wantPrice = /价格|多少钱|售价|预算|报价/.test(userText);
   const ev = selectEvidence(all, { audience: need.audience, scene: need.scene, wantPrice });
   s.evidence = ev;
   s.images = images;
   emit({ type: 'step', label: '调用资料与图片', detail: `${ev.length} 条证据 · ${images.length} 张官方图片` });
-  if (guardImageSupply(platform, s, emit)) return s;
+  if (sources.catalog) {
+    if (images.length < IMAGE_RANGE[platform][0]) emit({ type: 'notice', text: `${model.name} 配图不足，先交付文字草稿；发布前需要补图，不借用其他产品图片。` });
+  } else if (guardImageSupply(platform, s, emit)) return s;
 
   emit({ type: 'step', label: `撰写${platform}稿件` });
   const { data } = await chatJson<any>(
     [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: writingSystem(sources) },
       { role: 'user', content: writerPrompt(need, platform, ev, images, model) },
     ],
     { purpose: 'write', temperature: 0.5, maxTokens: 4500, timeoutMs: 180_000 },
@@ -494,15 +604,16 @@ export async function writeFromNeed(need: NeedCard, userText: string, s: Session
   return s;
 }
 
-/** 对话入口：无稿件则创作；已有稿件时，换平台/换场景重新规划，其余按指令改稿。 */
+/** 默认由模型理解自由对话；注入源保留原创作流程。 */
 export async function handleMessage(text: string, s: Session, emit: Emit, history = '', sources: AgentSources = DEFAULT_SOURCES): Promise<Session> {
+  if (sources === DEFAULT_SOURCES) return handleCatalogMessage(text, s, emit, history);
   if (guardModel(text, s, emit, sources)) return s;
   if (!s.draft || !s.need) return createDraft(text, s, emit, history, sources);
-  if (guardNeed(s.need, s, emit)) return s;
+  if (guardNeed(s.need, s, emit, sources)) return s;
   emit({ type: 'step', label: '理解需求' });
   const n = await understandForSession(text, s, sources);
   if (n.intent === 'chat') {
-    emit({ type: 'notice', text: '这条不需要改稿。想调整的话，直接告诉我要改哪里。' });
+    emit({ type: 'notice', text: await answerConversation(text, history, s.evidence ?? [], { modelName: s.modelName, need: s.need }) });
     return s;
   }
   const prev = s.need;
@@ -537,21 +648,22 @@ export async function handleMessage(text: string, s: Session, emit: Emit, histor
 
 /** 按指令改稿（表达调整/换卖点/换受众等）。版本号加一，旧核验自动失效，随后重新核验。 */
 export async function reviseDraft(instruction: string, s: Session, emit: Emit, sources: AgentSources = DEFAULT_SOURCES): Promise<Session> {
+  if (sources === DEFAULT_SOURCES) return handleCatalogMessage(instruction, s, emit);
   if (guardModel(instruction, s, emit, sources)) return s;
-  if (s.need && guardNeed(s.need, s, emit)) return s;
+  if (s.need && guardNeed(s.need, s, emit, sources)) return s;
   if (!s.draft || !s.evidence || !s.images || !s.need) {
     emit({ type: 'error', text: '还没有可修改的稿件' });
     return s;
   }
   const d = s.draft;
   s.images = uniqueModelImages(s.images, s.modelId);
-  if (guardImageSupply(d.platform, s, emit)) return s;
+  if (!sources.catalog && guardImageSupply(d.platform, s, emit)) return s;
   const model = sources.models.find((m) => m.id === s.modelId)!;
   emit({ type: 'step', label: '按你的要求改稿' });
   const prompt = writerPrompt(s.need, d.platform, s.evidence, s.images, model, `## 现有稿件（版本 ${d.version}）\n${JSON.stringify({ title: d.title, lead: d.lead, body: d.body, cta: d.cta, tags: d.tags, images: d.images, claims: d.claims })}\n\n## 用户修改要求\n${instruction}\n只改需要改的部分；不得引入证据清单之外的新事实；修改后 claims 必须同步更新。\n`);
   const { data } = await chatJson<any>(
     [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: writingSystem(sources) },
       { role: 'user', content: prompt },
     ],
     { purpose: 'revise', temperature: 0.4, maxTokens: 4500, timeoutMs: 180_000 },
@@ -568,8 +680,19 @@ export async function reviseDraft(instruction: string, s: Session, emit: Emit, s
 
 /** 用户直接编辑稿件文字：版本加一，核验作废并重跑。 */
 export async function editDraft(patch: Partial<Pick<Draft, 'title' | 'lead' | 'body' | 'cta'>>, s: Session, emit: Emit, sources: AgentSources = DEFAULT_SOURCES): Promise<Session> {
+  if (sources === DEFAULT_SOURCES) {
+    sources = createConversationSources(await loadCatalog());
+    // 兼容已保存的五款旧稿，但不跨系统转换，不替换其原有证据引用。
+    const entry = sources.catalog!.find((item) => item.id === s.modelId || item.creativeModelId === s.modelId);
+    if (entry && s.draft?.modelId === s.modelId) {
+      s.modelId = entry.id;
+      s.modelName = entry.name;
+      s.draft = { ...s.draft, modelId: entry.id, modelName: entry.name };
+      s.images = s.images?.map((image) => image.modelId === entry.creativeModelId ? { ...image, modelId: entry.id, modelName: entry.name } : image);
+    }
+  }
   if (guardModel(Object.values(patch).join('\n'), s, emit, sources)) return s;
-  if (s.need && guardNeed(s.need, s, emit)) return s;
+  if (s.need && guardNeed(s.need, s, emit, sources)) return s;
   if (!s.draft || !s.evidence || !s.images) {
     emit({ type: 'error', text: '还没有可编辑的稿件' });
     return s;
@@ -580,7 +703,7 @@ export async function editDraft(patch: Partial<Pick<Draft, 'title' | 'lead' | 'b
     return s;
   }
   s.images = uniqueModelImages(s.images, s.modelId);
-  if (guardImageSupply(s.draft.platform, s, emit)) return s;
+  if (!sources.catalog && guardImageSupply(s.draft.platform, s, emit)) return s;
   const next: Draft = { ...s.draft, ...patch, version: s.draft.version + 1 };
   s.draft = next;
   s.report = undefined;

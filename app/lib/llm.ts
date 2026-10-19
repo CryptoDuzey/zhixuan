@@ -47,7 +47,7 @@ async function once(settings: ModelSettings, model: string, messages: ChatMsg[],
   return c;
 }
 
-/** 依次尝试模型链；每个模型最多 2 次。返回文本与实际使用的模型。 */
+/** Transient errors retry; account failures stop and model-specific rejections advance. */
 export async function chat(messages: ChatMsg[], o: LlmOpts): Promise<{ text: string; model: string }> {
   const settings = getModelSettings();
   let lastErr = '';
@@ -64,15 +64,18 @@ export async function chat(messages: ChatMsg[], o: LlmOpts): Promise<{ text: str
         return { text, model };
       } catch (e: unknown) {
         throwIfStopped();
-        lastErr = publicModelError(e).message;
+        const error = publicModelError(e);
+        lastErr = error.message;
         calls.push({ at: new Date().toISOString(), model, purpose: o.purpose, ok: false, ms: Date.now() - t0, attempt, note: lastErr.slice(0, 120) });
         if (calls.length > 500) calls.shift();
         reportTool({ type: 'tool', tool: 'model', status: 'failed', label: toolLabel(o.purpose), ms: Date.now() - t0 });
+        if (error.code === 'quota_exhausted' || error.status === 401 || error.status === 402) throw error;
+        if ([400, 403, 404, 422].includes(error.status)) break;
         await abortableDelay(600 * attempt);
       }
     }
   }
-  throw new Error(`模型调用失败：${lastErr}`);
+  throw new ModelSettingsError(502, `模型调用失败：${lastErr}`);
 }
 
 export function extractJson<T = any>(text: string): T {

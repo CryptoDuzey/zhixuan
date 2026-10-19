@@ -22,10 +22,12 @@ export interface ModelSettingsInput {
 /** Only deliberate, public error messages may reach the API or call history. */
 export class ModelSettingsError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  readonly code?: 'quota_exhausted';
+  constructor(status: number, message: string, code?: 'quota_exhausted') {
     super(message);
     this.name = 'ModelSettingsError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -158,6 +160,31 @@ export function publicModelError(error: unknown): ModelSettingsError {
   return error instanceof ModelSettingsError ? error : new ModelSettingsError(502, '无法连接模型网关，请检查地址和网络。');
 }
 
+// Inspect only a bounded error body. Never retain or expose upstream messages:
+// gateways can include credentials even in apparently helpful error details.
+async function quotaFailure(response: Response): Promise<boolean> {
+  if (response.status === 402) return true;
+  const reader = response.body?.getReader();
+  if (!reader) return false;
+  try {
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > 16384) return false;
+      chunks.push(chunk.value);
+    }
+    const value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const error = value?.error;
+    return ['insufficient_quota', 'pre_consume_token_quota_failed', 'insufficient_balance', 'quota_exceeded']
+      .includes(error?.code)
+      || (typeof error?.message === 'string' && /额度不足|余额不足|insufficient (?:quota|balance)/i.test(error.message));
+  } catch { return false; }
+  finally { try { await reader.cancel(); } catch { /* Already closed. */ } }
+}
+
 /** No retry and no redirect: one user action creates at most one gateway request. */
 export async function fetchModelGateway(settings: ModelSettings, endpoint: 'models' | 'chat/completions', options: RequestInit = {}, timeoutMs = 15_000): Promise<unknown> {
   requireApiKey(settings);
@@ -174,6 +201,9 @@ export async function fetchModelGateway(settings: ModelSettings, endpoint: 'mode
     });
     if (!response.ok) {
       const status = response.status >= 400 && response.status < 600 ? response.status : 502;
+      if (await quotaFailure(response)) {
+        throw new ModelSettingsError(status, '当前模型密钥额度不足，请补充额度或在模型设置中更换可用密钥，再重新发送。', 'quota_exhausted');
+      }
       throw new ModelSettingsError(status, `模型网关返回 HTTP ${response.status}，请检查密钥、模型和网关状态。`);
     }
     try {

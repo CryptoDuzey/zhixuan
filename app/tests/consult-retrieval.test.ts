@@ -1,8 +1,12 @@
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { consult, type ConsultDependencies } from '../lib/consult.ts';
 import { unavailableRetrieval, type RetrievalSummary } from '../lib/retrieval.ts';
 import type { Evidence } from '../lib/facts.ts';
+
+beforeEach((t) => {
+  t.mock.method(globalThis, 'fetch', async () => { assert.fail('Unexpected network request in offline retrieval test'); });
+});
 
 const windowsPath = 'P1-产品参数库/Windows/MateBook 14/产品事实.md';
 const harmonyPath = 'P1-产品参数库/HarmonyOS/MateBook 14/产品事实.md';
@@ -51,10 +55,25 @@ test('详细任务即使提全库也执行检索，用户约束进入查询，�
   assert.ok(result.evidence.every((e) => e.docPath === windowsPath));
 });
 
-test('目录查看与招呼保持快速路径，不伪称已执行混合检索', async () => {
-  const deps = services({ retrieve: async () => assert.fail('no retrieval for quick path'), generate: async () => assert.fail('no model for quick path') });
+test('目录查看与招呼调用模型自然回应，不读候选资料或伪称已执行检索', async () => {
   for (const q of ['你好', '全库', '全部产品有哪些']) {
+    let calls = 0;
+    const reply = `你问的是“${q}”，可以先聊用途，再逐步了解对应设备。`;
+    const deps = services({
+      retrieve: async () => assert.fail('no retrieval for quick path'),
+      loadEvidence: async () => assert.fail('no creative facts for quick path'),
+      loadCatalogEvidence: async () => assert.fail('no candidate facts for quick path'),
+      generate: async (messages) => {
+        calls++;
+        assert.equal(messages.at(-1)?.content, q);
+        return { reply, questions: ['你更关心哪类设备？'] };
+      },
+    });
     const result = await consult(ask(q), deps);
+    assert.equal(calls, 1);
+    assert.ok(result.reply.startsWith(reply));
+    assert.deepEqual(result.recommendations, []);
+    assert.deepEqual(result.evidence, []);
     assert.equal(result.retrieval, undefined);
   }
 });
@@ -103,12 +122,46 @@ test('检索片段只辅助目录路由，不允许替换另一系统的产品�
   assert.equal(result.evidence[0].docId, 'windows');
 });
 
-test('路由无候选时仍带检索状态，但不自动退回创作的五款型号', async () => {
+test('路由无候选时保留自然回答和检索失败状态，不退回创作型号或泄漏内部错误', async () => {
+  let calls = 0;
   const result = await consult(ask('找适合我的设备'), services({
-    retrieve: async (q) => unavailableRetrieval(q), generate: async () => ({ candidateIds: [] }),
+    retrieve: async (q) => unavailableRetrieval(q),
+    generate: async () => {
+      calls++;
+      return {
+        candidateIds: [],
+        reply: '可以先把日常任务按记录、沟通和处理资料分开，再判断需要哪类设备。',
+        questions: ['现在最费时间的是哪件事？'],
+      };
+    },
+    loadEvidence: async () => assert.fail('no fallback creative facts without candidates'),
     loadCatalogEvidence: async () => assert.fail('no facts without candidates'),
   }));
+  assert.equal(calls, 1);
   assert.equal(result.retrieval?.status, 'unavailable');
+  assert.equal(result.reply, '可以先把日常任务按记录、沟通和处理资料分开，再判断需要哪类设备。');
+  assert.deepEqual(result.questions, ['现在最费时间的是哪件事？']);
   assert.equal(result.recommendations.length, 0);
-  assert.ok(result.questions?.length);
+  assert.deepEqual(result.evidence, []);
+});
+
+test('路由无候选且未给正文时再次请求模型自然回答，保留路由追问与检索状态', async () => {
+  let calls = 0;
+  const result = await consult(ask('想改善家里打印孩子作业的流程'), services({
+    loadEvidence: async () => assert.fail('no fallback creative facts'),
+    loadCatalogEvidence: async () => assert.fail('no candidate facts'),
+    generate: async (messages) => {
+      calls++;
+      assert.equal(messages.at(-1)?.content, '想改善家里打印孩子作业的流程');
+      return calls === 1
+        ? { candidateIds: ['unknown', null], questions: ['每周要打印多少作业？'] }
+        : { reply: '先把作业接收、排版和打印的步骤理顺，再看是否需要调整设备。' };
+    },
+  }));
+  assert.equal(calls, 2);
+  assert.equal(result.reply, '先把作业接收、排版和打印的步骤理顺，再看是否需要调整设备。');
+  assert.deepEqual(result.questions, ['每周要打印多少作业？']);
+  assert.equal(result.retrieval?.status, 'ready');
+  assert.deepEqual(result.recommendations, []);
+  assert.deepEqual(result.evidence, []);
 });

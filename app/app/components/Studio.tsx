@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { SessionView } from '../../lib/store.ts';
 import type { CheckReport, Draft } from '../../lib/check.ts';
 import ModelSettings from './ModelSettings';
+import { handoffStorage, takeHandoff, handoffMessage, type CreativeHandoff } from './frontend-handoff.ts';
 import { consumeAgentStream, parseAgentRun, runStatusText, type AgentRun } from '../../lib/agent-stream.ts';
 import {
   browserStorage, newStudioId, parseAgentSession, readStorage, SessionEpoch,
@@ -47,7 +48,7 @@ export default function Studio() {
   const [refresh, setRefresh] = useState(0);
   const ready = useRef(false);
   const requests = useRef(new SessionEpoch());
-  const boot = useRef<{ id: string; restore: boolean; product: string; scene: string; handoff: boolean } | null>(null);
+  const boot = useRef<{ id: string; restore: boolean; product: string; scene: string; handoff: boolean; transfer: CreativeHandoff | null; invalidTransfer: boolean } | null>(null);
   const [mode, setMode] = useState<'home' | 'work'>('home');
   const [input, setInput] = useState('');
   const [log, setLog] = useState<Msg[]>([]);
@@ -67,21 +68,27 @@ export default function Studio() {
   const [agentRun, setAgentRun] = useState<AgentRun | undefined>();
   const [stopping, setStopping] = useState(false);
   const cancelPending = useRef(false);
+  const [modelProgress, setModelProgress] = useState<{ callId: string; characters: number; mode: string } | null>(null);
+  const [handoffPlatform, setHandoffPlatform] = useState('');
 
   useEffect(() => {
     // Keep the first decision across StrictMode's setup/cleanup/setup cycle.
     if (!boot.current) {
       const query = new URLSearchParams(window.location.search);
       const saved = readStorage(browserStorage(), STUDIO_SESSION_KEY);
-      const handoff = query.has('product') || query.has('scene');
+      const hasTransfer = query.has('handoff');
+      const transfer = hasTransfer ? takeHandoff(handoffStorage(), query.get('handoff') || '') : null;
+      const handoff = hasTransfer || query.has('product') || query.has('scene');
       const restore = !handoff && validStudioId(saved.value);
       boot.current = {
         id: restore ? saved.value! : newStudioId(), restore,
-        product: query.get('product') ?? '', scene: (query.get('scene') ?? '').slice(0, 500), handoff,
+        product: transfer?.productId ?? query.get('product') ?? '', scene: (query.get('scene') ?? '').slice(0, 500), handoff,
+        transfer, invalidTransfer: hasTransfer && !transfer,
       };
       if (handoff) {
         query.delete('product');
         query.delete('scene');
+        query.delete('handoff');
         window.history.replaceState(window.history.state, '', `${window.location.pathname}${query.size ? `?${query}` : ''}${window.location.hash}`);
       }
     }
@@ -90,12 +97,14 @@ export default function Studio() {
     setSession({ id: initial.id, restore: initial.restore });
     const entry = PRODUCTS.find(([id]) => id === initial.product);
     if (initial.handoff) {
-      setSessionNote(entry ? '已从选购端开启新创作，请确认需求后发送。此前稿件不会混入本次对话。' : '已开启新创作。传入的产品未能识别，请重新选择产品。');
+      setSessionNote(initial.invalidTransfer ? '交接需求已过期或无法读取。已开启独立创作，请返回咨询重新确认，或在此补充需求。'
+        : entry ? '已从选购端开启独立创作，请确认下方需求后发送。产品信息将重新查证。' : '已开启新创作。传入的产品未能识别，请重新选择产品。');
     }
     if (entry && initial.handoff) {
       setProduct(entry[0]);
       pendingProduct.current = entry[1];
-      setInput(`为 ${entry[1]} 写一篇小红书。${initial.scene ? `场景：${initial.scene}` : '请先和我确认受众与使用场景。'}`);
+      setInput(initial.transfer ? handoffMessage(initial.transfer) : `为 ${entry[1]} 创作内容。${initial.scene ? `场景：${initial.scene}` : '请先和我确认受众、发布平台与使用场景。'}`);
+      setHandoffPlatform(initial.transfer?.platform || '');
     }
   }, []);
 
@@ -192,6 +201,8 @@ export default function Studio() {
     pendingProduct.current = '';
     historyRef.current = [];
     setBusy(false);
+    setModelProgress(null);
+    setHandoffPlatform('');
     setAgentRun(undefined);
     setStopping(false);
     cancelPending.current = false;
@@ -212,6 +223,7 @@ export default function Studio() {
     const stoppingSid = sid;
     const stoppingGeneration = runRef.current.id;
     cancelPending.current = true;
+    setModelProgress(null);
     setStopping(true);
     try {
       const response = await fetch('/api/agent/cancel', {
@@ -265,6 +277,7 @@ export default function Studio() {
     running.current = true;
     runRef.current = { id: runRef.current.id + 1, completed: false, updated: false };
     setBusy(true);
+    setModelProgress(null);
     setAgentRun(undefined);
     setStopping(false);
     cancelPending.current = false;
@@ -293,6 +306,7 @@ export default function Studio() {
         if (!task.current()) return;
         failedRef.current = true;
         push({ k: 'error', text: j.error ?? `请求失败（${res.status}）` });
+        if (payload.message) setInput(payload.message);
         return;
       }
       await consumeAgentStream(res, (event) => { if (task.current()) onEvent(event); });
@@ -305,6 +319,7 @@ export default function Studio() {
     } finally {
       if (!task.current()) return;
       closeSteps(failedRef.current);
+      setModelProgress(null);
       running.current = false;
       setBusy(false);
     }
@@ -315,6 +330,7 @@ export default function Studio() {
     if (state) {
       setAgentRun(state);
       if (state.status !== 'running') {
+        setModelProgress(null);
         setStopping(false);
         cancelPending.current = false;
         setSessionNote(runStatusText(state));
@@ -322,6 +338,12 @@ export default function Studio() {
       }
     }
     switch (e.type) {
+      case 'model_progress':
+        if (!cancelPending.current && typeof e.callId === 'string' && e.callId.length <= 200 && Number.isSafeInteger(e.characters) && e.characters >= 0
+          && (e.mode === 'stream' || e.mode === 'buffered')) {
+          setModelProgress({ callId: e.callId, characters: e.characters, mode: e.mode });
+        }
+        break;
       case 'run':
         break;
       case 'tool':
@@ -340,6 +362,7 @@ export default function Studio() {
         });
         break;
       case 'step':
+        setModelProgress(null);
         if (typeof e.label === 'string') setAgentRun((state) => state?.status === 'running' ? { ...state, phase: e.label } : state);
         addStep(e.label, e.detail);
         break;
@@ -351,6 +374,7 @@ export default function Studio() {
         push({ k: 'notice', text: e.text });
         break;
       case 'error':
+        setModelProgress(null);
         failedRef.current = true;
         push({ k: 'error', text: e.text });
         break;
@@ -363,6 +387,7 @@ export default function Studio() {
         setView((v) => (v ? { ...v, report: e.report } : v));
         break;
       case 'done':
+        setModelProgress(null);
         runRef.current.completed = true;
         setView(e.view);
         if (e.view?.draft?.modelId) setProduct(e.view.draft.modelId);
@@ -487,7 +512,7 @@ export default function Studio() {
         }}
         rows={compact ? 1 : 2}
         disabled={blocked}
-        maxLength={2000}
+        maxLength={30000}
       />
       <div className="composer-row">
         <div className="composer-context">
@@ -499,7 +524,7 @@ export default function Studio() {
             <option value="">先聊需求，再选产品</option>
             {PRODUCTS.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
-          <span className="chip">{draft ? draft.platform : '平台随需求判断'}</span>
+          <span className="chip">{draft ? draft.platform : handoffPlatform || '平台随需求判断'}</span>
         </div>
         <button type="submit" className="send" disabled={blocked || !input.trim()} aria-label="发送">
           ↑
@@ -510,6 +535,7 @@ export default function Studio() {
 
   const sessionStatus = (
     <div className="session-status" aria-live="polite" aria-busy={recovery === 'loading' || recovery === 'polling'}>
+      {busy && modelProgress && <p role="status">{modelProgress.mode === 'stream' ? `正在生成 · 已接收 ${modelProgress.characters} 字（尚未完成）` : '正在等待完整模型回复（尚未完成）'}</p>}
       {recovery === 'loading' ? <p role="status">正在恢复会话…</p> : null}
       {recovery === 'error' ? <p className="session-error" role="alert">{recoveryError}<button onClick={recoverTask}>重试恢复</button><span>也可点“新创作”开始。</span></p> : null}
       {recovery !== 'loading' && recovery !== 'error' && sessionNote ? <p role="status">{sessionNote}</p> : null}

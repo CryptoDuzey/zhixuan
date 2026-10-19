@@ -3,6 +3,7 @@ import { recoverSession, sessionRepository, toView } from '../../../lib/store.ts
 import { SessionStorageError, validSessionId, type SavedMessage } from '../../../lib/session-store.ts';
 import { withCallScope } from '../../../lib/ima.ts';
 import { createRun, encodeRunEvent, releaseRun, RunStoppedError, throwIfStopped, withRun } from '../../../lib/agent-runtime.ts';
+import { ModelSettingsError } from '../../../lib/model-settings.ts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -11,7 +12,7 @@ const headers = { 'cache-control': 'no-store' };
 const MAX_BODY = 32000;
 
 function storageMessage(error: unknown) {
-  return error instanceof SessionStorageError ? error.message : '本次任务未完成，请稍后重试。已保存的内容可以继续使用。';
+  return error instanceof SessionStorageError || error instanceof ModelSettingsError ? error.message : '本次任务未完成，请稍后重试。已保存的内容可以继续使用。';
 }
 
 export async function GET(req: Request) {

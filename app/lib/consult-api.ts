@@ -4,10 +4,11 @@ import { consultRepository, type ConsultRepository, type SavedConsult } from './
 import { cancelRun, createRun, encodeRunEvent, isRunActive, releaseRun, RunStoppedError, throwIfStopped, withRun } from './agent-runtime.ts';
 import { SessionStorageError, validSessionId } from './session-store.ts';
 import { withCallScope } from './ima.ts';
+import { ModelSettingsError } from './model-settings.ts';
 
 const headers = { 'cache-control': 'no-store' };
 const runKey = (id: string) => `consult:${id.toLowerCase()}`;
-const failure = (error: unknown) => error instanceof SessionStorageError || error instanceof ConsultError || error instanceof RunStoppedError
+const failure = (error: unknown) => error instanceof SessionStorageError || error instanceof ConsultError || error instanceof RunStoppedError || error instanceof ModelSettingsError
   ? error.message : '咨询暂时没有完成，请稍后重试。已保存的问题可以保留后继续。';
 
 async function readBody(request: Request, maximum = CONSULT_LIMITS.bodyBytes): Promise<unknown> {

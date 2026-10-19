@@ -74,6 +74,16 @@ interface RecordEntry {
   docs: LocalDoc[];
 }
 
+// The read-only service accepts eight simultaneous reads. Leave room for
+// other sessions instead of opening a connection for every catalog entry.
+async function readInBatches<T, R>(items: T[], read: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let offset = 0; offset < items.length; offset += 4) {
+    results.push(...await Promise.all(items.slice(offset, offset + 4).map(read)));
+  }
+  return results;
+}
+
 /** 可注入离线资料源；正式调用使用下方默认实例。 */
 export function createCatalog(sources: CatalogSources) {
   const texts = new Map<string, Promise<ReadResult>>();
@@ -106,7 +116,7 @@ export function createCatalog(sources: CatalogSources) {
     });
     const facts = index.filter((doc) =>
       /^P1-产品参数库\/(?:01-鸿蒙电脑|02-MateBook-Windows)\/[^/]+\/产品事实\.md$/.test(doc.path));
-    const full = await Promise.all(facts.map(async (doc): Promise<RecordEntry> => {
+    const full = await readInBatches(facts, async (doc): Promise<RecordEntry> => {
       const directory = doc.path.slice(0, -'产品事实.md'.length);
       const limit = index.find((item) => item.path === `${directory}卖点与限制.md`);
       if (!limit) throw new Error(`缺少完整型号限制：${directory}卖点与限制.md`);
@@ -126,8 +136,8 @@ export function createCatalog(sources: CatalogSources) {
         },
         docs: [doc, limit],
       };
-    }));
-    const discovered = await Promise.all(cards.map(async (doc): Promise<RecordEntry> => {
+    });
+    const discovered = await readInBatches(cards, async (doc): Promise<RecordEntry> => {
       const text = (await read(doc)).text!;
       const name = title(text, doc.path.split('/').at(-1)!.replace(/^\d+-|\.md$/g, ''));
       const category = field(text, '产品类别') ?? doc.path.split('/').at(-2)!;
@@ -150,7 +160,7 @@ export function createCatalog(sources: CatalogSources) {
         },
         docs: [doc],
       };
-    }));
+    });
     const represented = new Set(discovered.filter(({ entry }) => entry.level === 'full')
       .map(({ entry }) => entry.docPath));
     const records = [...discovered, ...full.filter(({ entry }) => !represented.has(entry.docPath))];

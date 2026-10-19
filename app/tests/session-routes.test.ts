@@ -15,8 +15,33 @@ const { GET: exportDraft } = await import('../app/api/export/route.ts');
 const { sessionRepository } = await import('../lib/store.ts');
 const { createRun, withRun } = await import('../lib/agent-runtime.ts');
 after(() => rmSync(directory, { recursive: true, force: true }));
+const catalogDoc = {
+  id: 'routes-product', path: 'P1-产品参数库/07-扩展产品目录/显示器/01-MateView.md',
+  title: 'MateView', bytes: 100, sha256: '',
+};
+const chatReply = '你好，可以先聊你的想法，或一起整理内容方向。';
+async function offlineFetch(input: string | URL | Request): Promise<Response> {
+  const target = new URL(String(input));
+  if (target.pathname === '/documents') return Response.json({ items: [catalogDoc] });
+  if (target.pathname === '/document' && target.searchParams.get('id') === catalogDoc.id) {
+    return new Response('# HUAWEI MateView\n- 产品类别：显示器\n仅用于产品发现，完整规格待补。');
+  }
+  if (target.pathname.endsWith('/chat/completions')) {
+    return Response.json({ choices: [{ message: { content: JSON.stringify({
+      intent: 'chat', modelId: null, evidenceModelIds: [], reply: chatReply,
+    }) } }] });
+  }
+  assert.fail(`意外网络请求：${target.pathname}`);
+}
 beforeEach((t) => {
-  t.mock.method(globalThis, 'fetch', async () => { throw new Error('No network permitted'); });
+  t.mock.method(process, 'cwd', () => directory);
+  const saved = process.env.OPENAI_NEXT_API_KEY;
+  process.env.OPENAI_NEXT_API_KEY = 'offline-placeholder';
+  t.after(() => {
+    if (saved === undefined) delete process.env.OPENAI_NEXT_API_KEY;
+    else process.env.OPENAI_NEXT_API_KEY = saved;
+  });
+  t.mock.method(globalThis, 'fetch', offlineFetch);
 });
 const request = (body: unknown) => new Request('http://localhost/api/agent', { method: 'POST', body: JSON.stringify(body) });
 const url = (id: string, path = 'agent') => new Request(`http://localhost/api/${path}?sessionId=${encodeURIComponent(id)}`);
@@ -42,16 +67,24 @@ test('任务重复提交和处理中导出均被拒绝，不污染对话', async
   sessionRepository.finish('locked-session');
 });
 
-test('无产品澄清不调用网络，完成后保存消息且可恢复', async () => {
-  const response = await POST(request({ sessionId: 'guard-session', message: '帮我写篇小红书' }));
+test('未选产品也经模型自由聊天，完成后保存回复且可恢复', async (t) => {
+  const modelCalls: unknown[] = [];
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    if (String(input).endsWith('/chat/completions')) modelCalls.push(JSON.parse(String(init?.body)));
+    return offlineFetch(input);
+  });
+  const response = await POST(request({ sessionId: 'guard-session', message: '你好' }));
   assert.equal(response.status, 200);
   const events = (await response.text()).trim().split('\n').map((line) => JSON.parse(line));
-  assert.ok(events.some((event) => event.type === 'clarify'));
+  assert.equal(modelCalls.length, 1);
+  assert.ok(events.some((event) => event.type === 'notice' && event.text === chatReply));
+  assert.ok(!events.some((event) => event.type === 'clarify'));
   assert.equal(events.at(-1).type, 'done');
   const saved = await (await GET(url('guard-session'))).json();
   assert.equal(saved.busy, false);
   assert.equal(saved.messages[0].role, 'user');
-  assert.equal(saved.messages[1].kind, 'clarify');
+  assert.equal(saved.messages[1].kind, 'notice');
+  assert.equal(saved.messages[1].text, chatReply);
   assert.equal(saved.view.draft, undefined);
 });
 
@@ -210,20 +243,15 @@ test('真实路由协商SSE并在GET恢复运行状态，done仅说明任务结�
 });
 
 test('取消正在等待的模型，不重试；忽略取消的迟到结果不会改坏下一项任务', async (t) => {
-  t.mock.method(process, 'cwd', () => directory);
-  const key = process.env.OPENAI_NEXT_API_KEY;
-  process.env.OPENAI_NEXT_API_KEY = 'offline-placeholder';
-  t.after(() => {
-    if (key === undefined) delete process.env.OPENAI_NEXT_API_KEY;
-    else process.env.OPENAI_NEXT_API_KEY = key;
-  });
   let calls = 0;
   let resolveFetch!: (value: Response) => void;
   let started!: () => void;
   let signal: AbortSignal | undefined;
   const ready = new Promise<void>((resolve) => { started = resolve; });
-  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+  t.mock.method(globalThis, 'fetch', async (input, options) => {
+    if (!String(input).endsWith('/chat/completions')) return offlineFetch(input);
     calls++;
+    if (calls > 1) return offlineFetch(input);
     signal = options?.signal as AbortSignal;
     started();
     return new Promise<Response>((resolve) => { resolveFetch = resolve; });
@@ -248,12 +276,14 @@ test('取消正在等待的模型，不重试；忽略取消的迟到结果不�
   sessionRepository.get('cancel-session').session.modelId = '';
   sessionRepository.save('cancel-session');
   const next = await POST(request({ sessionId: 'cancel-session', message: '你好' }));
-  await next.text();
+  const nextEvents = (await next.text()).trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(nextEvents.at(-1).run.status, 'completed');
+  assert.ok(nextEvents.some((event) => event.type === 'notice' && event.text === chatReply));
   const newRun = sessionRepository.get('cancel-session').run!.id;
   assert.notEqual(runId, newRun);
   resolveFetch(Response.json({ choices: [{ message: { content: '{"next_action":"write","platform":"小红书"}' } }] }));
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sessionRepository.get('cancel-session').run!.id, newRun);
   assert.equal(sessionRepository.get('cancel-session').session.draft, undefined);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });

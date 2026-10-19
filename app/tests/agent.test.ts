@@ -477,7 +477,7 @@ test('改稿的图片选择也遵守人工复核优先规则，避免先写出�
   const transport = offlineTransport(t);
   const s = completedSession();
   s.images = [image('IMG1', true), image('IMG2', false)];
-  await reviseDraft('压缩正文', s, () => {});
+  await reviseDraft('压缩正文', s, () => {}, mockSources(t));
   assert.equal(transport.mock.callCount(), 2); // 本地替身：改稿 + 核验
   const request = JSON.parse(String(transport.mock.calls[0].arguments[1]?.body));
   assert.match(request.messages[1].content, /实际画面描述优先于索引类别/);
