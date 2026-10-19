@@ -1,0 +1,8 @@
+# Optional CPU retrieval environment. No dependency is installed at runtime.
+# These versions match the prepared local environment. No online installation
+# or clean-environment wheel availability was verified.
+sentence-transformers==6.1.0
+numpy==1.26.4
+scipy==1.16.3
+scikit-learn==1.9.0
+torch==2.12.0

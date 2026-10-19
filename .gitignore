@@ -21,6 +21,10 @@
 !/docs/演示脚本.md
 !/docs/提交材料清单.md
 !/docs/统筹检查记录.md
+!/docs/复赛打磨计划.md
+!/docs/复赛验收记录.md
+!/docs/Agent运行说明.md
+!/docs/知识库运行说明.md
 **/node_modules/
 **/.env*
 **/data/private/
@@ -28,3 +32,5 @@
 **/tmp/
 **/*.log
 **/*.tsbuildinfo
+**/__pycache__/
+**/*.pyc

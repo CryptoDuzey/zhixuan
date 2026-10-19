@@ -162,6 +162,7 @@ export function publicModelError(error: unknown): ModelSettingsError {
 export async function fetchModelGateway(settings: ModelSettings, endpoint: 'models' | 'chat/completions', options: RequestInit = {}, timeoutMs = 15_000): Promise<unknown> {
   requireApiKey(settings);
   const controller = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${settings.baseUrl}/${endpoint}`, {
@@ -169,7 +170,7 @@ export async function fetchModelGateway(settings: ModelSettings, endpoint: 'mode
       headers: { 'content-type': 'application/json', authorization: `Bearer ${settings.apiKey}` },
       redirect: 'error',
       cache: 'no-store',
-      signal: controller.signal,
+      signal,
     });
     if (!response.ok) {
       const status = response.status >= 400 && response.status < 600 ? response.status : 502;
@@ -182,6 +183,7 @@ export async function fetchModelGateway(settings: ModelSettings, endpoint: 'mode
       throw new ModelSettingsError(502, '模型网关返回了无法识别的响应。');
     }
   } catch (error) {
+    if (options.signal?.aborted) throw options.signal.reason;
     if (controller.signal.aborted) throw new ModelSettingsError(504, '模型网关响应超时，请稍后重试。');
     throw publicModelError(error);
   } finally {

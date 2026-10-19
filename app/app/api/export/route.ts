@@ -1,6 +1,6 @@
-import { hasSession, getSession } from '../../../lib/store.ts';
+import { recoverSession } from '../../../lib/store.ts';
 import { isCheckCurrent } from '../../../lib/check.ts';
-import { getCallLog } from '../../../lib/ima.ts';
+import { validSessionId, SessionStorageError } from '../../../lib/session-store.ts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -8,8 +8,14 @@ export const dynamic = 'force-dynamic';
 /** 导出：只有核验结果对应当前版本且无拦截项才放行；附依据清单、图片来源与核验报告。 */
 export async function GET(req: Request) {
   const id = new URL(req.url).searchParams.get('sessionId') ?? '';
-  if (!hasSession(id)) return Response.json({ error: '会话不存在' }, { status: 404 });
-  const s = getSession(id);
+  if (!validSessionId(id)) return Response.json({ error: '工作记录编号无效。' }, { status: 400 });
+  let record;
+  try { record = recoverSession(id); } catch (error) {
+    return Response.json({ error: error instanceof SessionStorageError ? error.message : '工作记录暂时无法读取。' }, { status: 500 });
+  }
+  if (!record) return Response.json({ error: '会话不存在' }, { status: 404 });
+  if (record.busy) return Response.json({ error: '任务仍在进行，完成后再导出。' }, { status: 409 });
+  const s = record.session;
   const d = s.draft;
   if (!d) return Response.json({ error: '还没有稿件' }, { status: 409 });
   if (!isCheckCurrent(s.report, d)) return Response.json({ error: '当前版本尚未核验，不能导出' }, { status: 409 });
@@ -33,8 +39,8 @@ export async function GET(req: Request) {
     claims: d.claims,
     evidence,
     report: s.report,
-    imaCallsScope: 'service-recent',
-    imaCallsNote: '以下为服务最近调用，可能包含其他会话；本稿依据以 evidence 和 images 为准。',
-    imaCalls: getCallLog().slice(-40),
-  });
+    imaCallsScope: 'session',
+    imaCallsNote: '仅含本会话最近500条知识库调用与缓存使用记录；本稿依据以 evidence 和 images 为准。',
+    imaCalls: record.calls,
+  }, { headers: { 'cache-control': 'no-store' } });
 }

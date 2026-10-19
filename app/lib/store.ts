@@ -1,20 +1,34 @@
-// 会话存储（进程内）与前端视图：把 Session 转成可序列化、不含服务端路径的结构。
+// 会话落盘与前端视图：原始资料仅保存在本机私密目录。
+import { join } from 'node:path';
 import { newSession, type NeedCard, type Session } from './agent.ts';
 import { localImageUrl } from './ima.ts';
 import type { CheckReport, Draft } from './check.ts';
+import { SessionRepository } from './session-store.ts';
+import { isRunActive } from './agent-runtime.ts';
 
-const g = globalThis as unknown as { __zx_sessions?: Map<string, Session> };
-const sessions = (g.__zx_sessions ??= new Map<string, Session>());
+const g = globalThis as unknown as { __zx_repository?: SessionRepository };
+export const sessionRepository = (g.__zx_repository ??= new SessionRepository(
+  process.env.ZHIXUAN_SESSION_DIR || join(process.cwd(), 'data', 'private', 'sessions'),
+  newSession,
+));
 
 export function getSession(id: string): Session {
-  let s = sessions.get(id);
-  if (!s) {
-    s = newSession();
-    sessions.set(id, s);
-  }
-  return s;
+  return sessionRepository.get(id).session;
 }
-export const hasSession = (id: string) => sessions.has(id);
+export const hasSession = (id: string) => !!sessionRepository.find(id);
+
+/** 结束写盘失败后，只有恢复状态成功落盘才能解除孤立的忙碌锁。 */
+export function recoverSession(id: string) {
+  const record = sessionRepository.find(id);
+  if (record?.busy && record.run && !isRunActive(id, record.run.id)) {
+    const now = new Date().toISOString();
+    record.run.status = 'interrupted';
+    record.run.updatedAt = now;
+    record.run.endedAt = now;
+    sessionRepository.finish(id, true);
+  }
+  return record;
+}
 
 export interface SessionView {
   need?: NeedCard;

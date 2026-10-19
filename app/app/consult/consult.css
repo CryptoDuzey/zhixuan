@@ -35,6 +35,20 @@
 .consult-evidence blockquote p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
 .consult-evidence cite { color: var(--ink-2); font-style: normal; font-size: 11px; overflow-wrap: anywhere; }
 .consult-price-evidence { margin-top: 20px; }
+.consult-retrieval { margin-top: 20px; padding-top: 14px; }
+.consult-retrieval summary { line-height: 1.8; }
+.consult-retrieval summary:focus-visible, .consult-retrieval-items a:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+.consult-retrieval-state { margin-left: 12px; color: var(--ink-3); font-size: 11px; }
+.consult-retrieval-meta { margin-top: 12px; color: var(--ink-2); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.consult-retrieval-meta p { margin: 3px 0; }
+.consult-retrieval-message { margin: 10px 0 0; color: var(--ink-2); line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.consult-retrieval-message.is-unavailable { color: var(--accent); }
+.consult-retrieval-items { list-style: none; margin: 14px 0 0; padding: 0; }
+.consult-retrieval-items li { padding: 12px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.consult-retrieval-items a { color: var(--ink); text-decoration-color: var(--line); text-underline-offset: 4px; line-height: 1.8; }
+.consult-retrieval-items a:hover { color: var(--accent); }
+.consult-retrieval-items li p { margin: 7px 0 4px; color: var(--ink-2); line-height: 1.85; white-space: pre-wrap; }
+.consult-retrieval-path { color: var(--ink-3); font-size: 11px; }
 .consult-bottom { position: sticky; bottom: 0; padding-top: 12px; background: linear-gradient(transparent, #f8f7f4 16px); margin-top: auto; }
 .consult-composer { background: var(--consult-paper); border-radius: 24px; box-shadow: 0 8px 36px rgba(70,58,39,.055), 0 0 0 1px var(--line); }
 .consult-composer textarea { max-height: 200px; }
@@ -44,6 +58,10 @@
 .consult-handoff a { color: var(--accent); text-decoration: none; flex-shrink: 0; }
 .consult-handoff > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .consult-status { margin: 24px 0 0; color: var(--ink-2); font-size: 13px; }
+.consult-progress { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 24px; color: var(--ink-2); font-size: 13px; }
+.consult-progress button, .consult-start-new { flex: none; border: 1px solid var(--line); padding: 7px 13px; border-radius: 999px; font-size: 12px; background: var(--consult-paper); }
+.consult-tools { list-style: none; padding: 0; margin: 14px 0 0; font-size: 11px; color: var(--ink-2); }
+.consult-tools li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 14px; padding: 4px 0; overflow-wrap: anywhere; }
 .consult-error { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; margin-top: 18px; background: #f4e9e6; border-radius: 12px; color: var(--accent); font-size: 13px; }
 .consult-error button { text-decoration: underline; flex-shrink: 0; }
 @media (max-width: 600px) {
