@@ -1,10 +1,16 @@
 # Publish source and reviewed deliverables only.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/app/
 !/docs/
 !/scripts/
+!/kb/
+/kb/*
+!/kb/README.md
+!/kb/华为PC全板块深度知识库_v7/
+/kb/华为PC全板块深度知识库_v7/P4-价格政策库（机密）/
 !/output/
 /output/*
 !/output/pdf/

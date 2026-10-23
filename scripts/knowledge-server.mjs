@@ -1,5 +1,5 @@
 // Read-only adapter for an independently obtained, authorized knowledge folder.
-// No knowledge documents or credentials are distributed with this repository.
+// The repository includes a public corpus; credentials and private records stay separate.
 import http from 'node:http';
 import { readdir, lstat, realpath, open } from 'node:fs/promises';
 import { constants } from 'node:fs';

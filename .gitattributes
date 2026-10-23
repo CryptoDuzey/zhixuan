@@ -1,0 +1,2 @@
+# Preserve corpus bytes so source manifests remain reproducible across platforms.
+kb/** -text
