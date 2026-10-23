@@ -22,6 +22,10 @@ export interface ToolEvent {
   cacheHit?: boolean;
 }
 
+export type ModelEvent =
+  | { type: 'model_progress'; callId: string; characters: number; mode: 'stream' | 'buffered' }
+  | { type: 'model_preview'; callId: string; kind: 'answer' | 'draft'; text: string; status: 'generating' | 'discarded' };
+
 export class RunStoppedError extends Error {
   status: 'cancelled' | 'timed_out' | 'failed';
   constructor(status: RunStoppedError['status'], message?: string) {
@@ -39,7 +43,7 @@ interface RunContext {
   controller: AbortController;
   modelAttempts: number;
   maxModelAttempts: number;
-  onTool: (event: ToolEvent) => void;
+  onTool: (event: ToolEvent | ModelEvent) => void;
   settled: boolean;
 }
 
@@ -82,6 +86,13 @@ export function throwIfStopped() {
 export function reportTool(event: ToolEvent) {
   throwIfStopped();
   context.getStore()?.onTool(event);
+}
+
+/** Ephemeral model progress bypasses session persistence and cannot outlive its run. */
+export function reportModel(event: ModelEvent) {
+  throwIfStopped();
+  const current = context.getStore();
+  if (current && !current.settled) current.onTool(event);
 }
 
 export function useModelAttempt() {

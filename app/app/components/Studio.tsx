@@ -1,8 +1,15 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type PointerEvent } from 'react';
+import ChatHistory from './ChatHistory';
+import { conversationId, pinConversation } from './conversation-location.ts';
+import { workspacePointerSplit, watchWorkspaceBreakpoint, WORKSPACE_DIVIDER } from './workspace-split.ts';
 import type { SessionView } from '../../lib/store.ts';
 import type { CheckReport, Draft } from '../../lib/check.ts';
+import { hasCompleteClaimReview, isBlockingIssue, isPublishableReport } from '../../lib/check.ts';
 import ModelSettings from './ModelSettings';
+import AnswerText from './AnswerText';
+import ModelPreview, { useModelPreview } from './ModelPreview';
+import { draftMessage, restoredDraftMessage } from '../../lib/draft-message.ts';
 import { handoffStorage, takeHandoff, handoffMessage, type CreativeHandoff } from './frontend-handoff.ts';
 import { consumeAgentStream, parseAgentRun, runStatusText, type AgentRun } from '../../lib/agent-stream.ts';
 import {
@@ -20,7 +27,7 @@ type Msg =
   | { k: 'error'; text: string }
   | { k: 'agent'; text: string };
 
-type Exported = { publishable: string; [k: string]: unknown };
+type Exported = { publishable: string; version: number; [k: string]: unknown };
 
 const SUGGEST = [
   '大学新生开学选机，写一篇小红书',
@@ -50,6 +57,11 @@ export default function Studio() {
   const requests = useRef(new SessionEpoch());
   const boot = useRef<{ id: string; restore: boolean; product: string; scene: string; handoff: boolean; transfer: CreativeHandoff | null; invalidTransfer: boolean } | null>(null);
   const [mode, setMode] = useState<'home' | 'work'>('home');
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [split, setSplit] = useState(40);
+  const workspaceRef = useRef<HTMLElement>(null);
+  const dividerRef = useRef<HTMLDivElement>(null);
+  const workspaceDrag = useRef<{ pointerId: number; grab: number; startX: number; startLeft: number; moved: boolean } | null>(null);
   const [input, setInput] = useState('');
   const [log, setLog] = useState<Msg[]>([]);
   const [view, setView] = useState<SessionView | null>(null);
@@ -57,11 +69,16 @@ export default function Studio() {
   const [sheet, setSheet] = useState(false);
   const [tones, setTones] = useState(false);
   const [exp, setExp] = useState<Exported | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
+  const exportRequests = useRef(new SessionEpoch());
+  const exportPending = useRef(false);
   const [copied, setCopied] = useState(false);
   const [settings, setSettings] = useState(false);
   const [product, setProduct] = useState('');
   const pendingProduct = useRef('');
   const logRef = useRef<HTMLDivElement>(null);
+  const followLog = useRef(true);
   const historyRef = useRef<string[]>([]);
   const runRef = useRef({ id: 0, completed: false, updated: false });
   const running = useRef(false);
@@ -69,19 +86,41 @@ export default function Studio() {
   const [stopping, setStopping] = useState(false);
   const cancelPending = useRef(false);
   const [modelProgress, setModelProgress] = useState<{ callId: string; characters: number; mode: string } | null>(null);
+  const { preview, resetPreview, clearPreview, receivePreviewEvent } = useModelPreview();
   const [handoffPlatform, setHandoffPlatform] = useState('');
+
+  useEffect(() => () => exportRequests.current.cancel(), []);
+  useEffect(() => {
+    if (!workspaceOpen) { cancelWorkspaceDrag(); return; }
+    const media = window.matchMedia('(max-width:860px)');
+    return watchWorkspaceBreakpoint(media, cancelWorkspaceDrag);
+  }, [workspaceOpen]);
+  useEffect(() => {
+    const stored = Number(readStorage(browserStorage(), 'zhixuan.workspace.split.v1').value);
+    if (stored >= 28 && stored <= 64) setSplit(stored);
+  }, []);
+
+  function resetExport() {
+    exportRequests.current.cancel();
+    exportPending.current = false;
+    setExporting(false);
+    setExportError('');
+    setExp(null);
+    setCopied(false);
+  }
 
   useEffect(() => {
     // Keep the first decision across StrictMode's setup/cleanup/setup cycle.
     if (!boot.current) {
       const query = new URLSearchParams(window.location.search);
       const saved = readStorage(browserStorage(), STUDIO_SESSION_KEY);
+      const savedId = conversationId(window.location.search, saved.value);
       const hasTransfer = query.has('handoff');
       const transfer = hasTransfer ? takeHandoff(handoffStorage(), query.get('handoff') || '') : null;
       const handoff = hasTransfer || query.has('product') || query.has('scene');
-      const restore = !handoff && validStudioId(saved.value);
+      const restore = !handoff && validStudioId(savedId);
       boot.current = {
-        id: restore ? saved.value! : newStudioId(), restore,
+        id: restore ? savedId! : newStudioId(), restore,
         product: transfer?.productId ?? query.get('product') ?? '', scene: (query.get('scene') ?? '').slice(0, 500), handoff,
         transfer, invalidTransfer: hasTransfer && !transfer,
       };
@@ -118,6 +157,8 @@ export default function Studio() {
     const task = requests.current.start();
     ready.current = false;
     running.current = false;
+    clearPreview();
+    setModelProgress(null);
     setRecovery('loading');
     setRecoveryError('');
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -135,14 +176,15 @@ export default function Studio() {
         const snapshot = parseAgentSession(await response.json());
         if (!task.current()) return;
         setView(snapshot.view);
+        setWorkspaceOpen(!!snapshot.view.draft || (snapshot.busy && snapshot.view.need?.intent !== 'chat' && snapshot.view.need?.next_action === 'write'));
         setAgentRun(snapshot.run);
         setStopping(snapshot.busy && !!snapshot.run?.cancelRequested);
         cancelPending.current = snapshot.busy && !!snapshot.run?.cancelRequested;
-        setProduct(snapshot.view.draft?.modelId ?? '');
+        setProduct(PRODUCTS.find(([, name]) => name === snapshot.view.draft?.modelName)?.[0] ?? snapshot.view.draft?.modelId ?? '');
         setLog(snapshot.messages.map((m): Msg => {
           if (m.role === 'user') return { k: 'user', text: m.text };
           if (m.kind === 'clarify') return { k: 'clarify', question: m.text, options: m.options ?? [] };
-          return { k: m.kind ?? 'agent', text: m.text };
+          return { k: m.kind ?? 'agent', text: m.kind === 'agent' ? restoredDraftMessage(m.text) : m.text };
         }));
         historyRef.current = snapshot.messages.map((m) => `${m.role === 'user' ? '用户' : '助手'}：${m.text}`);
         setMode(snapshot.messages.length || snapshot.view.draft || snapshot.busy || snapshot.interrupted ? 'work' : 'home');
@@ -158,7 +200,7 @@ export default function Studio() {
             ? runStatusText(snapshot.run)
             : snapshot.interrupted
             ? '上次任务因服务重启而中断，尚未完成。已恢复保存的内容，请重新发送需求继续。'
-            : '已恢复稿件与对话，可以继续创作。');
+            : snapshot.view.draft ? '已恢复稿件与对话，可以继续创作。' : '已恢复对话，可以接着聊。');
         }
       } catch (cause) {
         if (!task.current()) return;
@@ -179,11 +221,13 @@ export default function Studio() {
   function saveId(id: string) {
     activeSid.current = id;
     const saved = writeStorage(browserStorage(), STUDIO_SESSION_KEY, id);
-    setStorageNote(saved ? '' : '浏览器未允许保存会话编号，本页仍可使用；关闭或刷新后可能无法找回。');
+    const pinned = pinConversation(id, window.location, window.history);
+    setStorageNote(pinned ? '' : saved ? '本页对话位置未能保存，刷新后可能打开最近使用的其他对话。' : '浏览器未允许保存会话编号，本页仍可使用；关闭或刷新后可能无法找回。');
   }
 
   function newCreation(note = '已开启新创作，说说这次的受众和场景。') {
     requests.current.cancel();
+    clearPreview();
     ready.current = false;
     running.current = false;
     const id = newStudioId();
@@ -194,6 +238,7 @@ export default function Studio() {
     setRecoveryError('');
     setSessionNote(note);
     setMode('home');
+    setWorkspaceOpen(false);
     setLog([]);
     setView(null);
     setInput('');
@@ -206,16 +251,91 @@ export default function Studio() {
     setAgentRun(undefined);
     setStopping(false);
     cancelPending.current = false;
-    setExp(null);
-    setCopied(false);
+    resetExport();
     setSheet(false);
     setTones(false);
   }
 
   function recoverTask() {
+    requests.current.cancel();
+    resetExport();
+    clearPreview();
+    setModelProgress(null);
     ready.current = false;
     setRecovery('loading');
     setRefresh((value) => value + 1);
+  }
+
+  function openConversation(id: string) {
+    if (busy || !validStudioId(id) || id === sid) return;
+    requests.current.cancel();
+    resetExport();
+    clearPreview();
+    setModelProgress(null);
+    ready.current = false;
+    running.current = false;
+    cancelPending.current = false;
+    setStopping(false);
+    setLog([]);
+    setView(null);
+    setWorkspaceOpen(false);
+    setInput('');
+    setProduct('');
+    pendingProduct.current = '';
+    historyRef.current = [];
+    setSheet(false);
+    setTones(false);
+    setRecoveryError('');
+    setSessionNote('');
+    setRecovery('loading');
+    setMode('work');
+    saveId(id);
+    setSession({ id, restore: true });
+    setRefresh(0);
+  }
+
+  function resizeWorkspace(value: number) {
+    if (!Number.isFinite(value)) return;
+    const width = Math.round(Math.min(64, Math.max(28, value)) * 10000) / 10000;
+    setSplit(width);
+    writeStorage(browserStorage(), 'zhixuan.workspace.split.v1', String(width));
+  }
+
+  function startWorkspaceDrag(event: PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0 || workspaceDrag.current || window.matchMedia('(max-width:860px)').matches) return;
+    const bounds = workspaceRef.current?.getBoundingClientRect();
+    if (!bounds || bounds.width <= 860) return;
+    const divider = event.currentTarget.getBoundingClientRect();
+    const grab = event.clientX - divider.left;
+    if (grab < 0 || grab > WORKSPACE_DIVIDER) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    workspaceDrag.current = { pointerId: event.pointerId, grab, startX: event.clientX,
+      startLeft: divider.left - bounds.left, moved: false };
+  }
+
+  function endWorkspaceDrag(event: PointerEvent<HTMLDivElement>) {
+    if (workspaceDrag.current?.pointerId !== event.pointerId) return;
+    cancelWorkspaceDrag();
+  }
+
+  function cancelWorkspaceDrag() {
+    const drag = workspaceDrag.current;
+    workspaceDrag.current = null;
+    const divider = dividerRef.current;
+    if (drag && divider?.hasPointerCapture(drag.pointerId)) divider.releasePointerCapture(drag.pointerId);
+  }
+
+  function moveWorkspaceDrag(event: PointerEvent<HTMLDivElement>) {
+    const drag = workspaceDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    const bounds = workspaceRef.current?.getBoundingClientRect();
+    if (!bounds || window.matchMedia('(max-width:860px)').matches) { endWorkspaceDrag(event); return; }
+    const next = workspacePointerSplit(bounds.width, event.clientX - bounds.left, drag.grab);
+    if (next === undefined) { endWorkspaceDrag(event); return; }
+    // A click or an attempted movement beyond a clamped minimum is not a new preference.
+    if (!drag.moved && (event.clientX === drag.startX || Math.abs((bounds.width - WORKSPACE_DIVIDER) * next / 100 - drag.startLeft) < 0.01)) return;
+    drag.moved = true;
+    resizeWorkspace(next);
   }
 
   async function stopTask() {
@@ -223,6 +343,7 @@ export default function Studio() {
     const stoppingSid = sid;
     const stoppingGeneration = runRef.current.id;
     cancelPending.current = true;
+    clearPreview();
     setModelProgress(null);
     setStopping(true);
     try {
@@ -242,12 +363,12 @@ export default function Studio() {
   }
 
   useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: 'smooth' });
-  }, [log]);
+    if (followLog.current) logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [log, preview?.text]);
 
   const draft: Draft | undefined = view?.draft;
   const report: CheckReport | undefined = view?.report;
-  const current = !!draft && !!report && report.draftVersion === draft.version;
+  const current = !!draft && !!report && report.draftVersion === draft.version && hasCompleteClaimReview(report, draft);
   const blocked = busy || recovery !== 'ready';
 
   const push = (m: Msg) => setLog((l) => [...l, m]);
@@ -274,6 +395,7 @@ export default function Studio() {
   async function run(payload: { message?: string; patch?: Partial<Draft> }, echo?: string) {
     if (running.current || !ready.current || !sid) return;
     const task = requests.current.start();
+    resetPreview();
     running.current = true;
     runRef.current = { id: runRef.current.id + 1, completed: false, updated: false };
     setBusy(true);
@@ -282,10 +404,11 @@ export default function Studio() {
     setStopping(false);
     cancelPending.current = false;
     failedRef.current = false;
-    setExp(null);
+    resetExport();
     setSessionNote('');
     setMode('work');
     if (echo) {
+      followLog.current = true;
       push({ k: 'user', text: echo });
       historyRef.current.push(`用户：${echo}`);
     }
@@ -310,6 +433,7 @@ export default function Studio() {
         return;
       }
       await consumeAgentStream(res, (event) => { if (task.current()) onEvent(event); });
+      if (!task.current()) return;
       if (!runRef.current.completed) throw new Error('本次任务未完成，请重试。');
     } catch (e: any) {
       if (!task.current()) return;
@@ -319,6 +443,7 @@ export default function Studio() {
     } finally {
       if (!task.current()) return;
       closeSteps(failedRef.current);
+      clearPreview();
       setModelProgress(null);
       running.current = false;
       setBusy(false);
@@ -326,6 +451,7 @@ export default function Studio() {
   }
 
   function onEvent(e: any) {
+    if (!receivePreviewEvent(e)) return;
     const state = parseAgentRun(e.run);
     if (state) {
       setAgentRun(state);
@@ -333,11 +459,18 @@ export default function Studio() {
         setModelProgress(null);
         setStopping(false);
         cancelPending.current = false;
-        setSessionNote(runStatusText(state));
+        setSessionNote(state.status === 'completed' ? '' : runStatusText(state));
         if (state.status !== 'completed') failedRef.current = true;
       }
     }
     switch (e.type) {
+      case 'need':
+        if (e.need?.intent !== 'chat' && e.need?.next_action === 'write') setWorkspaceOpen(true);
+        break;
+      case 'model_preview':
+        if (e.kind === 'draft' && e.status === 'generating') setWorkspaceOpen(true);
+        setModelProgress(null);
+        break;
       case 'model_progress':
         if (!cancelPending.current && typeof e.callId === 'string' && e.callId.length <= 200 && Number.isSafeInteger(e.characters) && e.characters >= 0
           && (e.mode === 'stream' || e.mode === 'buffered')) {
@@ -367,6 +500,7 @@ export default function Studio() {
         addStep(e.label, e.detail);
         break;
       case 'clarify':
+        setModelProgress(null);
         push({ k: 'clarify', question: e.question, options: e.options ?? [] });
         historyRef.current.push(`助手：${e.question}`);
         break;
@@ -379,6 +513,8 @@ export default function Studio() {
         push({ k: 'error', text: e.text });
         break;
       case 'draft':
+        setWorkspaceOpen(true);
+        setModelProgress(null);
         runRef.current.updated = true;
         setView((v) => ({ ...(v ?? { evidence: [], images: [] }), draft: e.draft, report: undefined }));
         break;
@@ -390,21 +526,14 @@ export default function Studio() {
         setModelProgress(null);
         runRef.current.completed = true;
         setView(e.view);
-        if (e.view?.draft?.modelId) setProduct(e.view.draft.modelId);
+        if (!e.view?.draft) setWorkspaceOpen(false);
+        if (e.view?.draft?.modelId) setProduct(PRODUCTS.find(([, name]) => name === e.view.draft.modelName)?.[0] ?? e.view.draft.modelId);
         if (!failedRef.current && runRef.current.updated && e.view?.draft) {
           const d: Draft = e.view.draft;
           const r: CheckReport | undefined = e.view.report;
-          const open = r ? r.issues.filter((x) => x.severity === 'block').length : 0;
-          const warn = r ? r.issues.length - open : 0;
           push({
             k: 'agent',
-            text: !r || r.draftVersion !== d.version
-              ? `第 ${d.version} 版草稿已保存，尚未完成核验。`
-              : r.status === 'pass' && r.issues.length === 0
-                ? `第 ${d.version} 版已核验，没有发现问题。`
-                : r.status !== 'pass' && r.issues.length === 0
-                  ? `第 ${d.version} 版核验未通过，请重新核验后再导出。`
-                  : `第 ${d.version} 版已核验：${open} 项必须处理，${warn} 项建议留意。点“查看依据”看具体位置。`,
+            text: draftMessage(d, r),
           });
         }
         break;
@@ -424,22 +553,40 @@ export default function Studio() {
   }
 
   async function doExport() {
-    if (blocked || !ready.current) return;
+    if (blocked || running.current || !ready.current || !draft || !isPublishableReport(report, draft) || exportPending.current) return;
     const exportingSid = sid;
+    const version = draft.version;
+    const task = exportRequests.current.start();
+    exportPending.current = true;
+    setExporting(true);
+    setExportError('');
+    setExp(null);
+    setCopied(false);
     setSheet(true);
     try {
-      const res = await fetch(`/api/export?sessionId=${encodeURIComponent(sid)}`);
+      const res = await fetch(`/api/export?sessionId=${encodeURIComponent(sid)}`, {
+        cache: 'no-store', signal: AbortSignal.any([task.signal, AbortSignal.timeout(20_000)]),
+      });
       const j = await res.json();
-      if (exportingSid !== activeSid.current) return;
+      if (!task.current() || exportingSid !== activeSid.current) return;
       if (!res.ok) {
-        setExp(null);
-        push({ k: 'notice', text: `不能导出：${j.error}` });
+        setExportError(typeof j.error === 'string' ? j.error : '正文暂时无法导出，请重试。');
+        return;
+      }
+      if (j.version !== version || typeof j.publishable !== 'string' || !j.publishable.trim()) {
+        if (Number.isSafeInteger(j.version) && j.version > version) recoverTask();
+        setExportError('稿件已更新或正文未准备好，请重新导出。');
         return;
       }
       setExp(j);
-    } catch (e: any) {
-      if (exportingSid !== activeSid.current) return;
-      push({ k: 'error', text: `导出失败：${e?.message ?? e}` });
+    } catch {
+      if (!task.current() || exportingSid !== activeSid.current) return;
+      setExportError('正文暂时无法导出，请重试。');
+    } finally {
+      if (task.current()) {
+        exportPending.current = false;
+        setExporting(false);
+      }
     }
   }
 
@@ -454,12 +601,15 @@ export default function Studio() {
     }
   }
 
-  function download() {
+  function download(format: 'text' | 'sources') {
     if (!exp) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(exp, null, 2)], { type: 'application/json' }));
+    const body = format === 'text' ? exp.publishable : JSON.stringify({
+      version: exp.version, platform: exp.platform, model: exp.model, images: exp.images, supplementaryImages: exp.supplementaryImages, evidence: exp.evidence,
+    }, null, 2);
+    const url = URL.createObjectURL(new Blob([body], { type: format === 'text' ? 'text/plain;charset=utf-8' : 'application/json' }));
     const a = document.createElement('a');
     a.href = url;
-    a.download = `zhixuan-export-v${draft?.version ?? 0}.json`;
+    a.download = `知选-第${exp.version}版${format === 'text' ? '正文.txt' : '来源清单.json'}`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -475,6 +625,7 @@ export default function Studio() {
   const header = (
     <header className="top">
       <div className="brand">
+        <ChatHistory kind="agent" activeId={sid} disabled={busy || recovery !== 'ready'} onSelect={openConversation} onNew={() => newCreation('')} />
         <span className="mark">知</span>知选
       </div>
       <nav className="seg" aria-label="模式">
@@ -483,7 +634,7 @@ export default function Studio() {
         </button>
         <a href="/consult">选购</a>
       </nav>
-      <div className="top-right">{draft ? <span className="model-label">{draft.modelName}</span> : null}<button className="new-session" disabled={!session} onClick={() => newCreation()}>新创作</button><button className="settings-trigger" disabled={busy} onClick={() => setSettings(true)}>模型设置</button></div>
+      <div className="top-right">{draft ? <button className="canvas-toggle" onClick={() => setWorkspaceOpen(value => !value)}>{workspaceOpen ? '收起稿件' : '打开稿件'}</button> : null}<button className="new-session" disabled={!session} onClick={() => newCreation('')}>新对话</button><button className="settings-trigger" aria-label="设置" disabled={busy} onClick={() => setSettings(true)}>设置</button></div>
       {settings ? <ModelSettings onClose={() => setSettings(false)} /> : null}
     </header>
   );
@@ -515,17 +666,7 @@ export default function Studio() {
         maxLength={30000}
       />
       <div className="composer-row">
-        <div className="composer-context">
-          <select aria-label="创作产品" className="product-select" value={product} disabled={blocked}
-            onChange={(e) => {
-              setProduct(e.target.value);
-              pendingProduct.current = PRODUCTS.find(([id]) => id === e.target.value)?.[1] || '';
-            }}>
-            <option value="">先聊需求，再选产品</option>
-            {PRODUCTS.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-          </select>
-          <span className="chip">{draft ? draft.platform : handoffPlatform || '平台随需求判断'}</span>
-        </div>
+        <span className="composer-hint">Shift + Enter 换行</span>
         <button type="submit" className="send" disabled={blocked || !input.trim()} aria-label="发送">
           ↑
         </button>
@@ -535,14 +676,14 @@ export default function Studio() {
 
   const sessionStatus = (
     <div className="session-status" aria-live="polite" aria-busy={recovery === 'loading' || recovery === 'polling'}>
-      {busy && modelProgress && <p role="status">{modelProgress.mode === 'stream' ? `正在生成 · 已接收 ${modelProgress.characters} 字（尚未完成）` : '正在等待完整模型回复（尚未完成）'}</p>}
+
       {recovery === 'loading' ? <p role="status">正在恢复会话…</p> : null}
       {recovery === 'error' ? <p className="session-error" role="alert">{recoveryError}<button onClick={recoverTask}>重试恢复</button><span>也可点“新创作”开始。</span></p> : null}
       {recovery !== 'loading' && recovery !== 'error' && sessionNote ? <p role="status">{sessionNote}</p> : null}
       {storageNote ? <p>{storageNote}</p> : null}
       {busy && agentRun?.status === 'running' ? (
         <div className="run-status" role="status">
-          <span>{stopping ? '正在停止，请等待确认' : runStatusText(agentRun)}</span>
+          <span>{stopping ? '正在停止，请等待确认' : '正在整理内容…'}</span>
           <button type="button" onClick={stopTask} disabled={stopping}>{stopping ? '等待确认' : '停止任务'}</button>
         </div>
       ) : null}
@@ -555,8 +696,10 @@ export default function Studio() {
         {header}
         <main className="home">
           <div className="home-inner">
-            <h1>今天，想打动谁？</h1>
-            <p className="sub">说说受众和场景，剩下的交给知选。</p>
+            <div className="home-art" aria-hidden="true" />
+            <span className="home-eyebrow">知选 · 创作</span>
+            <h1>好内容，从一句话开始。</h1>
+            <p className="sub">聊个想法，或一起写点什么。</p>
             {sessionStatus}
             {composer('例如：给大学新生写一篇开学选机的小红书')}
             <div className="suggest">
@@ -568,7 +711,7 @@ export default function Studio() {
             </div>
           </div>
         </main>
-        <div className="foot">基于已下载的指定知识库 · 支持查看原文依据</div>
+        <div className="foot"><span>HUAWEI 华为中国区 × 拓浙 AI 生态</span><span>浙客松 · 参赛作品</span></div>
       </div>
     );
   }
@@ -595,49 +738,44 @@ export default function Studio() {
 
   const usedIds = new Set((draft?.claims ?? []).flatMap((c) => c.factIds));
   const imgById = new Map((view?.images ?? []).map((i) => [i.id, i]));
-  const blocks = report?.issues.filter((i) => i.severity === 'block') ?? [];
+  const blocks = report?.issues.filter(isBlockingIssue) ?? [];
   const coverImage = draft?.images[0];
   const coverRef = coverImage ? imgById.get(coverImage.imageId) : undefined;
   const status = !draft || !current ? 'run' : blocks.length || report!.status !== 'pass' ? 'fix' : 'pass';
   const statusText = !draft
     ? ''
     : busy && !current
-      ? '草稿预览 · 待核验'
+      ? '正在整理'
       : !current
-        ? '待核验'
+        ? '草稿'
         : blocks.length
           ? `${blocks.length} 项必须处理`
           : report!.status !== 'pass'
-            ? '核验未通过'
+            ? '需要调整'
           : report!.issues.length
             ? `通过，${report!.issues.length} 项建议`
-            : report!.status === 'pass' ? '核验通过' : '核验未通过';
+            : report!.status === 'pass' ? '可导出' : '需要调整';
 
   return (
     <div className="shell">
       {header}
-      <main className="work">
+      <main className={`work${workspaceOpen ? '' : ' conversation-only'}`} ref={workspaceRef}
+        style={workspaceOpen ? { gridTemplateColumns: `minmax(280px, ${split}fr) 12px minmax(360px, ${100 - split}fr)` } : undefined}>
         <section className="chat" aria-label="对话">
           {sessionStatus}
-          <div className="chat-log" ref={logRef} aria-live="polite">
+          <div className="chat-log" ref={logRef} aria-live="polite" onScroll={event => {
+            const node = event.currentTarget;
+            followLog.current = node.scrollHeight - node.scrollTop - node.clientHeight < 48;
+          }}>
             {log.map((m, i) => {
               if (m.k === 'user') return <div key={i} className="msg-user">{m.text}</div>;
-              if (m.k === 'notice') return <div key={i} className="notice">{m.text}</div>;
               if (m.k === 'error') return <div key={i} className="errbox" role="alert">{m.text}</div>;
-              if (m.k === 'tool') return (
-                <div key={i} className={`tool-status${m.status === 'failed' ? ' failed' : ''}`}>
-                  <span>{m.tool === 'model' ? '模型' : '资料'} · {m.label}</span>
-                  <span>{m.status === 'started' ? busy ? '进行中' : '结果未确认' : m.status === 'failed' ? '调用失败' : '已返回'}
-                    {m.status === 'completed' && m.cacheHit ? ' · 使用缓存' : ''}
-                    {m.ms !== undefined ? ` · ${(m.ms / 1000).toFixed(1)} 秒` : ''}
-                  </span>
-                </div>
-              );
-              if (m.k === 'agent')
+              if (m.k === 'tool' || m.k === 'steps') return null;
+              if (m.k === 'agent' || m.k === 'notice')
                 return (
                   <div key={i} className="msg-agent">
                     <span className="mark">知</span>
-                    <div className="txt">{m.text}</div>
+                    <div className="txt"><AnswerText text={m.text} /></div>
                   </div>
                 );
               if (m.k === 'clarify')
@@ -656,26 +794,23 @@ export default function Studio() {
                     </div>
                   </div>
                 );
-              return (
-                <div key={i} className="msg-agent">
-                  <span className="mark">知</span>
-                  <div className="activity">
-                    <ul>
-                      {m.steps.map((s, j) => (
-                        <li key={j}>
-                          <span className={`dot ${s.done ? 'done' : s.failed ? 'fail' : 'live'}`} />
-                          <span>{s.label}{s.detail ? `：${s.detail}` : ''}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-              );
+              return null;
             })}
+            {busy && <ModelPreview preview={preview} />}
           </div>
-          {composer('继续说：换成朋友圈 / 换成差旅场景 / 更口语一点', true)}
+          {composer('继续聊聊，或告诉我想写什么…', true)}
         </section>
-
+        {workspaceOpen ? <><div ref={dividerRef} className="workspace-divider" role="separator" aria-label="调整对话和稿件宽度" aria-orientation="vertical" tabIndex={0}
+          aria-valuemin={28} aria-valuemax={64} aria-valuenow={split}
+          onPointerDown={startWorkspaceDrag}
+          onPointerMove={moveWorkspaceDrag}
+          onPointerUp={endWorkspaceDrag}
+          onPointerCancel={endWorkspaceDrag}
+          onLostPointerCapture={endWorkspaceDrag}
+          onKeyDown={event => {
+            if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); resizeWorkspace(split + (event.key === 'ArrowLeft' ? -3 : 3)); }
+            if (event.key === 'Home') { event.preventDefault(); resizeWorkspace(40); }
+          }} />
         <section className={`canvas${draft ? ' editing' : ''}`} aria-label="稿件画布">
           <div className="canvas-head">
             <div className="platforms" role="group" aria-label="平台">
@@ -692,9 +827,9 @@ export default function Studio() {
             <article className="paper">
               <div className="paper-meta">
                 <span>{draft.platform}</span>
-                <span>可直接点击文字修改，修改后会重新核验</span>
+                <span>点击文字即可修改</span>
               </div>
-              {!current ? <div className="draft-preview" role="status">草稿预览 · 尚未完成本版核验，暂不可导出。</div> : null}
+              {!current ? <div className="draft-preview" role="status">内容还在整理，稍后可以导出。</div> : null}
               <h2
                 className="ms-title"
                 contentEditable={!blocked}
@@ -712,7 +847,7 @@ export default function Studio() {
               {coverImage && coverRef ? (
                 <figure className="fig cover-photo">
                   <img src={coverRef.src} alt={coverImage.caption || coverRef.filename} />
-                  <figcaption><span className="pos">{coverImage.position}</span> {coverImage.caption}</figcaption>
+                  <figcaption>{coverImage.caption}</figcaption>
                 </figure>
               ) : null}
               <div className="ms-body" contentEditable={!blocked} suppressContentEditableWarning key={`b${draft.version}`} onBlur={(e) => commit('body', e.currentTarget)}>
@@ -726,7 +861,7 @@ export default function Studio() {
                       <figure className="fig" key={im.imageId}>
                         {ref ? <img src={ref.src} alt={im.caption || ref.filename} loading="lazy" /> : <div className="gap">图片 {im.imageId} 不在本次资料中</div>}
                         <figcaption>
-                          <span className="pos">{im.position}</span> {im.caption}
+                          {im.caption}
                         </figcaption>
                       </figure>
                     );
@@ -747,14 +882,23 @@ export default function Studio() {
                   ))}
                 </div>
               ) : null}
+              {view?.supplementaryImages?.length ? <section className="scene-figs" aria-label="辅助场景配图">
+                <h3>场景配图</h3>
+                {view.supplementaryImages.map(image => <figure className="fig" key={image.id}>
+                  <img src={image.src} alt={image.caption} loading="lazy" />
+                  <figcaption>{image.caption}</figcaption>
+                  <a className="opt" href={image.src} download={`scene-${image.id}.png`}>保存场景图</a>
+                </figure>)}
+                <button className="opt" disabled={blocked} onClick={() => submit('移除当前稿件的所有AI辅助场景图，保留原文和图库产品图，不要生成新图。')}>移除场景配图</button>
+              </section> : null}
             </article>
           ) : (
             <article className="paper">
               <div className="paper-meta">
                 <span>稿件</span>
-                <span>{busy ? '正在核对产品资料' : '等待需求'}</span>
+                <span>{busy ? '正在处理…' : '等待需求'}</span>
               </div>
-              <div className="gap">{busy ? '正在核对产品资料，稿件很快出现在这里。' : '说出受众和场景，稿件会出现在这里。'}</div>
+              <div className="gap">{busy ? '正在处理你的问题。' : '说出受众和场景，稿件会出现在这里。'}</div>
             </article>
           )}
 
@@ -781,52 +925,56 @@ export default function Studio() {
                   </div>
                 ) : null}
               </div>
-              <button onClick={() => setSheet(true)}>查看依据</button>
-              <button className="primary" disabled={blocked || !current || report?.status !== 'pass' || blocks.length > 0} onClick={doExport}>
-                核验后导出
+              <button disabled={blocked} onClick={() => submit('给当前这篇补充一张有意义的场景配图，优先使用图库已有的图；缺少合适环境图时才生成，不要生成产品外观。')}>补充配图</button>
+              <button onClick={() => setSheet(true)}>内容建议</button>
+              <button className="primary" disabled={blocked || exporting || !draft || !isPublishableReport(report, draft)} onClick={doExport}>
+                导出内容
               </button>
             </div>
           ) : null}
-        </section>
+        </section></> : null}
       </main>
 
       {sheet ? (
         <>
           <div className="sheet-back" onClick={() => setSheet(false)} />
-          <aside className="sheet" role="dialog" aria-label="资料与依据">
+          <aside className="sheet" role="dialog" aria-label="内容建议与来源">
             <div className="sheet-head">
-              <span>资料与依据</span>
+              <span>内容建议与来源</span>
               <button onClick={() => setSheet(false)} aria-label="关闭">
                 关闭
               </button>
             </div>
             <div className="sheet-body">
+              {exporting ? <p role="status">正在准备正文…</p> : null}
+              {exportError ? <div className="issue" role="alert">{exportError}<button className="opt" disabled={blocked || exporting} onClick={doExport}>重新导出</button></div> : null}
               {exp ? (
                 <>
-                  <h3>导出文本（附核验记录）</h3>
+                  <h3>可复制的正文</h3>
                   <div className="issue" style={{ whiteSpace: 'pre-wrap' }}>{exp.publishable}</div>
                   <div style={{ display: 'flex', gap: 8, margin: '8px 0 4px' }}>
                     <button className="opt" onClick={copyText}>{copied ? '已复制' : '复制文本'}</button>
-                    <button className="opt" onClick={download}>下载依据清单与核验报告</button>
+                    <button className="opt" onClick={() => download('text')}>下载正文</button>
+                    <button className="opt" onClick={() => download('sources')}>下载来源清单</button>
                   </div>
                 </>
               ) : null}
 
-              <h3>核验结果</h3>
+              <h3>内容建议</h3>
               {!report ? (
-                <div className="issue">这一版还没有核验结果。</div>
+                <div className="issue">这一版还没有内容建议。</div>
               ) : report.draftVersion !== draft?.version ? (
-                <div className="issue">现有核验对应第 {report.draftVersion} 版，稿件已更新，需要重新核验。</div>
+                <div className="issue">稿件有了新的修改，请稍候。</div>
               ) : report.status !== 'pass' && report.issues.length === 0 ? (
-                <div className="issue">这一版核验未通过，暂时没有返回具体问题，请重新核验后再导出。</div>
+                <div className="issue">这版还需要调整，暂时不能导出。可以让知选重新整理一次。</div>
               ) : report.issues.length === 0 ? (
-                <div className="issue">没有发现问题。已核对 {report.verifiedClaimIds.length} 条结论、{report.verifiedImageIds.length} 张图片。</div>
+                <div className="issue">这版可以导出。</div>
               ) : (
                 report.issues.map((it, i) => (
-                  <div key={i} className={`issue${it.severity === 'block' ? ' block' : ''}`}>
+                  <div key={i} className={`issue${isBlockingIssue(it) ? ' block' : ''}`}>
                     <q>{it.text}</q>
                     <span className="why">
-                      {it.severity === 'block' ? '必须处理' : '建议留意'} · {it.location} · {it.reason}（建议：{it.action}）
+                      {isBlockingIssue(it) ? '必须处理' : '建议留意'} · {it.location} · {it.reason}（建议：{it.action}）
                     </span>
                   </div>
                 ))
@@ -836,19 +984,20 @@ export default function Studio() {
               {(view?.evidence ?? []).map((e) => (
                 <div key={e.id} className={`ev${usedIds.has(e.id) ? ' used' : ''}`}>
                   <div className="id">
-                    {e.id} · {e.docTitle}
+                    {e.docTitle}
                     {e.section ? ` · ${e.section}` : ''}
                     {usedIds.has(e.id) ? ' · 本稿引用' : ''}
                   </div>
                   <div>{e.text}</div>
-                  <div className="src">{e.source} · 读取于 {e.readAt}</div>
+                  <div className="src">{e.source}</div>
+                  {e.documentUrl ? <a href={e.documentUrl} target="_blank" rel="noopener noreferrer">查看完整资料</a> : null}
                 </div>
               ))}
 
               <h3>图片来源</h3>
               {(view?.images ?? []).map((im) => (
                 <div key={im.id} className="ev">
-                  <div className="id">{im.id} · {im.filename}</div>
+                  <div>{im.caption}</div>
                   <div className="src">{im.source}</div>
                 </div>
               ))}

@@ -28,6 +28,16 @@ textarea, input { font: inherit; color: inherit; }
 .new-session { white-space: nowrap; padding: 5px 0; }
 .new-session:hover:not(:disabled) { color: var(--ink); }
 .new-session:active:not(:disabled) { transform: translateY(1px); }
+.model-preview { flex: none; min-width: 0; margin: 12px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); text-align: left; }
+.model-preview-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-bottom: 8px; font-size: 11px; color: var(--ink-2); line-height: 1.6; }
+.model-preview-text { max-height: min(28dvh, 240px); overflow-y: auto; overscroll-behavior: contain; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 14px; line-height: 1.85; }
+.chat .model-preview { margin: 0; }
+@media (max-width: 860px) {
+  .chat:has(.model-preview) { height: 52dvh; max-height: 52dvh; }
+  .work:has(.model-preview) .canvas { min-height: 0; }
+  .chat:has(.model-preview) .chat-log { container-type: size; }
+  .chat .model-preview-text { max-height: max(0px, min(14dvh, calc(100cqh - 76px))); }
+}
 @media (max-width: 480px) {
   .top .seg a, .top .seg button { padding-inline: 12px; }
   .top-right { gap: 8px; }
@@ -57,3 +67,29 @@ textarea, input { font: inherit; color: inherit; }
 .suggest button:hover { color: var(--ink); }
 .foot { position: fixed; left: 0; right: 0; bottom: 14px; text-align: center; color: var(--ink-3); font-size: 12px; pointer-events: none; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* A quiet editorial canvas shared by the two independent entrances. */
+:root { --bg:#f7f5f1; --canvas:#eeece7; --paper:#fffefa; --ink:#252520; --ink-2:#77756d; --ink-3:#aaa69d; --line:#302b2010; }
+.shell .top { height:68px; padding-inline:28px; border-bottom:1px solid var(--line); background:#f7f5f1ed; z-index:3; }
+.shell { grid-template-rows:68px minmax(0,1fr); }
+.shell .brand { letter-spacing:.3px; }
+.shell .seg { background:transparent; gap:4px; }
+.shell .seg a,.shell .seg button { border-radius:8px; padding:6px 16px; font-size:12px; }
+.shell .seg .on { background:#252520; color:#fffefa; box-shadow:none; }
+.shell .home { position:relative; isolation:isolate; overflow:auto; padding:64px 24px 112px; display:grid; place-items:center; }
+.shell .home-inner { position:relative; width:min(680px,100%); z-index:1; }
+.home-art { position:fixed; z-index:-1; pointer-events:none; inset:68px 0 0; background:url('/art/zhixuan-paper-ribbon.png') center right/auto 100% no-repeat; opacity:.22; mix-blend-mode:multiply; }
+.home-eyebrow { display:block; font-size:11px; letter-spacing:3px; text-transform:uppercase; color:var(--accent); margin-bottom:18px; }
+.shell .home h1 { font-family:var(--serif); font-size:clamp(29px,4vw,44px); font-weight:500; letter-spacing:-1.2px; margin:0 0 14px; }
+.shell .home .sub { color:var(--ink-2); margin:0 0 36px; font-size:14px; letter-spacing:.5px; }
+.shell .composer { background:#fffefbf0; border:1px solid #dcd8d0; box-shadow:0 10px 40px #372a1508; border-radius:22px; padding:18px 20px 12px; }
+.shell .composer textarea { font-size:15px; line-height:1.8; min-height:68px; }
+.composer-hint { color:var(--ink-3); font-size:10px; letter-spacing:.3px; }
+.shell .send { background:var(--ink); border-radius:50%; color:#fff; }
+.shell .suggest { gap:10px; margin-top:22px; justify-content:flex-start; }
+.shell .suggest button { font-size:11px; padding:8px 12px; border:1px solid var(--line); border-radius:999px; background:#fff8; color:var(--ink-2); }
+.shell .suggest button:hover { border-color:#c53b3855; color:var(--accent); }
+.foot { position:fixed; bottom:20px; display:flex; justify-content:center; gap:16px; font-size:10px; letter-spacing:.5px; }
+.foot span + span { border-left:1px solid #aaa69d55; padding-left:16px; }
+.canvas-toggle { font-size:11px; color:var(--ink-2); white-space:nowrap; }
+@media(max-width:600px) { .shell .top { padding-inline:10px; }.shell .brand { font-size:14px; gap:4px; }.shell .top-right { gap:9px; font-size:11px; }.shell .seg a,.shell .seg button { padding:5px 9px; }.shell .home { padding:48px 22px 104px; }.shell .home .sub { margin-bottom:28px; }.shell .composer { padding:16px 16px 11px; }.foot { flex-direction:column; gap:3px; bottom:12px; }.foot span+span { border:0; padding:0; }.home-art { background-position:65% center; opacity:.15; }.canvas-toggle { display:none; } }

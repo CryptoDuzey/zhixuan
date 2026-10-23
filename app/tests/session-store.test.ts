@@ -37,6 +37,47 @@ function running(): RunState {
   };
 }
 
+test('Windows瞬时EPERM只重试原子替换，不删除旧稿或重复写临时文件', { skip: process.platform !== 'win32' }, (t) => {
+  const { dir, repo, reopen } = fixture(t);
+  const record = repo.get('transient-rename');
+  record.session.modelName = '原稿'; repo.save('transient-rename');
+  const original = fs.renameSync;
+  let attempts = 0;
+  const mocked = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof fs.renameSync>) => {
+    if (String(args[0]).startsWith(dir + sep) && attempts++ === 0) throw Object.assign(new Error('temporary lock'), { code: 'EPERM' });
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+  record.session.modelName = '已保存的新稿';
+  repo.save('transient-rename');
+  assert.equal(attempts, 2);
+  assert.equal(reopen().get('transient-rename').session.modelName, '已保存的新稿');
+  assert.equal(readdirSync(dir).filter(name => name.endsWith('.tmp')).length, 0);
+});
+
+test('非EPERM的原子替换失败只尝试一次，永久EPERM有界回滚', (t) => {
+  const { dir, repo, reopen } = fixture(t);
+  const record = repo.get('permanent-rename');
+  record.session.modelName = '已保存原稿'; repo.save('permanent-rename');
+  let code = 'ENOSPC', attempts = 0;
+  const original = fs.renameSync;
+  const mocked = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof fs.renameSync>) => {
+    if (String(args[0]).startsWith(dir + sep)) { attempts++; throw Object.assign(new Error('unavailable'), { code }); }
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+  record.session.modelName = '不能提交';
+  assert.throws(() => repo.save('permanent-rename'), SessionStorageError);
+  assert.equal(attempts, 1);
+  code = 'EPERM'; attempts = 0;
+  record.session.modelName = '仍不能提交';
+  assert.throws(() => repo.save('permanent-rename'), SessionStorageError);
+  assert.equal(attempts, process.platform === 'win32' ? 4 : 1);
+  assert.equal(reopen().get('permanent-rename').session.modelName, '已保存原稿');
+});
+
 test('对话、稿件和核验版本实际落盘，新进程仓库可恢复', (t) => {
   const { dir, repo, reopen } = fixture(t);
   const record = repo.get('session-one');

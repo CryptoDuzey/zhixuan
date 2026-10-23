@@ -59,6 +59,137 @@ function answer(): ConsultAnswer {
 
 const call = (target: string): CallLog => ({ at: '', op: 'read', target, ok: true });
 
+for (const scenario of [
+  { code: 'EPERM', failures: 1, success: true },
+  { code: 'EPERM', failures: 3, success: true },
+  { code: 'EPERM', failures: Infinity, success: false },
+  { code: 'EACCES', failures: Infinity, success: false },
+  { code: 'ENOSPC', failures: Infinity, success: false },
+  { code: 'EXDEV', failures: Infinity, success: false },
+]) test(`Windows 精确替换 ${scenario.code}/${scenario.failures}：有限重试且保留原文件`, { skip: process.platform !== 'win32' }, (t) => {
+  const { dir, repo, reopen } = fixture(t);
+  const record = repo.get('consult-one');
+  record.run = running();
+  repo.save('consult-one');
+  const run = record.run;
+  const path = join(dir, 'consult-one.json');
+  const saved = readFileSync(path, 'utf8');
+  const originalRename = fs.renameSync;
+  const originalUnlink = fs.unlinkSync;
+  const attempts: Parameters<typeof fs.renameSync>[] = [];
+  const waits: number[] = [];
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  t.mock.method(Atomics, 'wait', (_array: unknown, _index: number, _value: number, ms: number) => { waits.push(ms); return 'timed-out'; });
+  const rename = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof fs.renameSync>) => {
+    if (String(args[1]) === path) {
+      attempts.push(args);
+      assert.equal(readFileSync(path, 'utf8'), saved);
+      if (attempts.length <= scenario.failures) throw Object.assign(new Error('locked'), { code: scenario.code, syscall: 'rename' });
+    }
+    return originalRename(...args);
+  });
+  const unlink = t.mock.method(fs, 'unlinkSync', (...args: Parameters<typeof fs.unlinkSync>) => {
+    assert.notEqual(String(args[0]), path, 'never delete the destination');
+    return originalUnlink(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { rename.mock.restore(); unlink.mock.restore(); syncBuiltinESMExports(); });
+  run.sequence++;
+  const next = call('new-call');
+  if (scenario.success) {
+    repo.appendCall('consult-one', next);
+    assert.deepEqual(reopen().find('consult-one'), record);
+    assert.deepEqual(record.calls, [next]);
+    assert.equal(logs.length, 0);
+  } else {
+    assert.throws(() => repo.appendCall('consult-one', next), SessionStorageError);
+    assert.equal(readFileSync(path, 'utf8'), saved);
+    assert.deepEqual(record, JSON.parse(saved));
+    assert.equal(record.run, run);
+    assert.equal(logs.length, 1);
+    assert.equal(JSON.parse(String(logs[0][1])).cause.code, scenario.code);
+  }
+  const retryCount = scenario.code === 'EPERM' ? Math.min(scenario.failures, 3) : 0;
+  assert.equal(attempts.length, retryCount + 1);
+  assert.deepEqual(waits, [10, 25, 50].slice(0, retryCount));
+  assert.ok(attempts.every(args => args[0] === attempts[0][0] && args[1] === path));
+  assert.deepEqual(readdirSync(dir), ['consult-one.json']);
+});
+
+test('保存失败只在内部记录安全的 cause/code/syscall，不向用户暴露底层信息', (t) => {
+  const { dir, repo } = fixture(t);
+  repo.save('consult-one');
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  const original = fs.renameSync;
+  const mocked = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof fs.renameSync>) => {
+    if (String(args[1]).startsWith(dir + sep)) {
+      throw Object.assign(new Error(`secret-key ${dir}`), {
+        code: 'EPERM', syscall: 'rename', path: dir,
+        cause: Object.assign(new TypeError(`secret-key ${dir}`), { code: 'EACCES', syscall: 'open' }),
+      });
+    }
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+  assert.throws(() => repo.save('consult-one'), (error: unknown) => {
+    assert.ok(error instanceof SessionStorageError);
+    assert.equal(error.cause, undefined);
+    assert.ok(!error.message.includes('EPERM'));
+    return true;
+  });
+  assert.equal(logs.length, 1);
+  assert.deepEqual(JSON.parse(String(logs[0][1])), {
+    event: 'consult_storage_failure', operation: 'rename',
+    cause: { name: 'Error', code: 'EPERM', syscall: 'rename',
+      cause: { name: 'TypeError', code: 'EACCES', syscall: 'open' } },
+  });
+  assert.ok(!JSON.stringify(logs).includes(dir));
+  assert.ok(!JSON.stringify(logs).includes('secret-key'));
+});
+
+test('诊断输出异常也不妨碍回滚原记录和清除临时文件', (t) => {
+  const { dir, repo } = fixture(t);
+  repo.save('consult-one');
+  const record = repo.get('consult-one');
+  const saved = readFileSync(join(dir, 'consult-one.json'), 'utf8');
+  failWrites(t, dir);
+  t.mock.method(console, 'error', () => { throw new Error('logger unavailable'); });
+  record.turns.push({ question: '未保存' });
+  assert.throws(() => repo.save('consult-one'), SessionStorageError);
+  assert.deepEqual(record, JSON.parse(saved));
+  assert.equal(readFileSync(join(dir, 'consult-one.json'), 'utf8'), saved);
+  assert.deepEqual(readdirSync(dir), ['consult-one.json']);
+});
+
+test('非 Windows 的 EPERM 不重试；任意错误字段和循环 cause 不泄露', (t) => {
+  const { dir, repo } = fixture(t);
+  repo.save('consult-one');
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  const original = fs.renameSync;
+  let attempts = 0;
+  const error = Object.assign(new Error('private-key'), { code: 'EPERM', syscall: 'private-key', name: 'private-key' });
+  Object.assign(error, { cause: error });
+  const mocked = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof fs.renameSync>) => {
+    if (String(args[1]).startsWith(dir + sep)) { attempts++; throw error; }
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+  assert.throws(() => repo.save('consult-one'), SessionStorageError);
+  assert.equal(attempts, 1);
+  assert.equal(logs.length, 1);
+  assert.ok(!JSON.stringify(logs).includes('private-key'));
+  const cause = JSON.parse(String(logs[0][1])).cause;
+  assert.deepEqual(cause.cause.cause, { name: 'UnknownError', code: 'EPERM' });
+});
+
 test('get 创建空咨询且不写盘，find 不创建记录', (t) => {
   const { dir, repo, reopen } = fixture(t);
   assert.equal(repo.find('consult-one'), undefined);

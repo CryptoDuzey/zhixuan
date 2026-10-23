@@ -1,5 +1,6 @@
 import { after, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,7 +18,7 @@ const { createRun, withRun } = await import('../lib/agent-runtime.ts');
 after(() => rmSync(directory, { recursive: true, force: true }));
 const catalogDoc = {
   id: 'routes-product', path: 'P1-产品参数库/07-扩展产品目录/显示器/01-MateView.md',
-  title: 'MateView', bytes: 100, sha256: '',
+  title: 'MateView', bytes: 100, sha256: createHash('sha256').update('# HUAWEI MateView\n- 产品类别：显示器\n仅用于产品发现，完整规格待补。').digest('hex'),
 };
 const chatReply = '你好，可以先聊你的想法，或一起整理内容方向。';
 async function offlineFetch(input: string | URL | Request): Promise<Response> {
@@ -86,6 +87,19 @@ test('未选产品也经模型自由聊天，完成后保存回复且可恢复',
   assert.equal(saved.messages[1].kind, 'notice');
   assert.equal(saved.messages[1].text, chatReply);
   assert.equal(saved.view.draft, undefined);
+});
+
+test('已有稿件后继续普通聊天，不在恢复历史里重复追加稿件完成消息', async t => {
+  t.mock.method(globalThis, 'fetch', offlineFetch);
+  const record = sessionRepository.get('chat-with-draft');
+  record.session.draft = { version: 1, modelId: 'd14', modelName: 'D14', platform: '朋友圈', title: '原稿', lead: '', body: '原稿正文', cta: '', tags: [], images: [], claims: [] };
+  sessionRepository.save('chat-with-draft');
+  const response = await POST(request({ sessionId: 'chat-with-draft', message: '你好' }));
+  await response.text();
+  const saved = await (await GET(url('chat-with-draft'))).json();
+  assert.equal(saved.messages.length, 2);
+  assert.equal(saved.messages[1].text, chatReply);
+  assert.equal(saved.view.draft.body, '原稿正文');
 });
 
 test('非法与过大请求不创建会话，分块超限也拒绝', async () => {
@@ -202,13 +216,28 @@ test('导出仅包含本会话调用，修改版本未核验则禁止导出', as
   s.modelId = 'd14'; s.modelName = 'D14';
   s.draft = { version: 1, modelId: 'd14', modelName: 'D14', platform: '朋友圈', title: '先看课程', lead: '', body: '确认软件后再选', cta: '以官网为准', tags: [], images: [], claims: [] };
   s.report = { draftVersion: 1, status: 'pass', issues: [], verifiedClaimIds: [], verifiedImageIds: [], checkedAt: new Date().toISOString() };
+  s.draft.images = [{ imageId: 'IMG1', caption: '本次配图', position: '正文后' }];
+  s.images = [{ id: 'IMG1', filename: 'product.jpg', docId: 'versioned-product-image', modelId: 'd14',
+    modelName: 'D14', caption: '已确认外观', purpose: '外观', width: 800, height: 600,
+    source: '本地已下载知识库', url: '', sha256: 'a'.repeat(64) }];
   sessionRepository.appendCall('export-session', { at: new Date().toISOString(), op: 'read', target: 'own-document', ok: true });
   sessionRepository.appendCall('another-session', { at: new Date().toISOString(), op: 'read', target: 'other-document', ok: true });
   const response = await exportDraft(url('export-session', 'export'));
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.imaCallsScope, 'session');
+  assert.equal(body.images[0].sha256, 'a'.repeat(64), '导出保留本稿保存的图片版本，不临时换成当前目录版本');
   assert.deepEqual(body.imaCalls.map((entry: { target: string }) => entry.target), ['own-document']);
+  s.draft.claims = [{ id: 'C1', text: '旧稿产品主张', factIds: ['E1'] }];
+  sessionRepository.save('export-session');
+  assert.equal((await exportDraft(url('export-session', 'export'))).status, 409, '旧pass缺少覆盖记录时不能继续导出');
+  s.report.reviewedClaimIds = ['C1'];
+  sessionRepository.save('export-session');
+  assert.equal((await exportDraft(url('export-session', 'export'))).status, 200);
+  s.report.status = 'needs_fix';
+  sessionRepository.save('export-session');
+  assert.equal((await exportDraft(url('export-session', 'export'))).status, 409, '失败的检查即使没有列出具体问题，也不能导出');
+  s.report.status = 'pass';
   s.draft.version = 2;
   sessionRepository.save('export-session');
   assert.equal((await exportDraft(url('export-session', 'export'))).status, 409);

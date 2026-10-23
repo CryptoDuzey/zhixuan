@@ -2,8 +2,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 import type { Recommendation } from '../../lib/consult.ts';
-import type { RetrievalSummary } from '../../lib/retrieval.ts';
 import ModelSettings from '../components/ModelSettings';
+import AnswerText from '../components/AnswerText';
+import ModelPreview, { useModelPreview } from '../components/ModelPreview';
+import ConsultProductShowcase from '../components/ConsultProductShowcase';
+import ChatHistory from '../components/ChatHistory';
+import { conversationId, pinConversation } from '../components/conversation-location.ts';
 import {
   browserStorage, CONSULT_MAX_TURNS, CONSULT_SESSION_KEY, CONSULT_ID_KEY, decodeConsultSession,
   parseConsultAnswer, parseConsultSnapshot, consultRunText, newStudioId, validStudioId,
@@ -12,41 +16,6 @@ import {
 import { consumeAgentStream, parseAgentRun, type AgentRun } from '../../lib/agent-stream.ts';
 import './consult.css';
 import { HANDOFF_PLATFORMS, handoffStorage, saveHandoff, handoffMessage, type CreativeHandoff, type HandoffPlatform } from '../components/frontend-handoff.ts';
-
-const STARTERS = [
-  '知识库里有哪些产品？按类别给我看看完整目录',
-  '大学学习，预算 6000 左右，主要用 Office，怎么选？',
-  '经常出差，要开会和做文档，想先了解选购思路',
-  '需要用 CAD 和专业插件，选电脑前该核实什么？',
-];
-
-function KnowledgeRetrieval({ retrieval }: { retrieval: RetrievalSummary }) {
-  const ready = retrieval.status === 'ready';
-  return (
-    <details className="consult-evidence consult-retrieval">
-      <summary>知识库检索<span className="consult-retrieval-state">{ready ? `${retrieval.returned} 条结果` : '暂不可用'}</span></summary>
-      <div className="consult-retrieval-meta">
-        <p>来源：{retrieval.source}{!ready ? '（暂不可用）' : ''}</p>
-        <p>搜索范围：全部已索引文档{retrieval.scannedFiles !== undefined ? ` · 扫描 ${retrieval.scannedFiles} 份文件` : ''}</p>
-        {retrieval.query && <p>检索词：{retrieval.query}</p>}
-        <p>{ready ? `返回 ${retrieval.returned} 条 · 最多 ${retrieval.maximumResults} 条` : '本次未获得可用检索结果'} · 非穷尽结果，不代表知识库完整目录</p>
-      </div>
-      <p className={`consult-retrieval-message${ready ? '' : ' is-unavailable'}`}>{retrieval.message}</p>
-      {ready && retrieval.items.length === 0 && <p className="consult-retrieval-message">没有找到匹配资料，可换个关键词继续问。</p>}
-      {ready && retrieval.items.length > 0 && (
-        <ol className="consult-retrieval-items">
-          {retrieval.items.map((item, index) => (
-            <li key={`${item.id}-${index}`}>
-              <a href={item.documentUrl} target="_blank" rel="noopener noreferrer" aria-label={`查看原文：${item.title}`}>{item.title}<span aria-hidden="true"> ↗</span></a>
-              <p>{item.preview || '暂无摘要，可打开原文查看。'}</p>
-              <span className="consult-retrieval-path">{item.path}</span>
-            </li>
-          ))}
-        </ol>
-      )}
-    </details>
-  );
-}
 
 export default function ConsultPage() {
   const [input, setInput] = useState('');
@@ -68,6 +37,7 @@ export default function ConsultPage() {
   const [handoffError, setHandoffError] = useState('');
   const [fallbackText, setFallbackText] = useState('');
   const [modelProgress, setModelProgress] = useState<{ callId: string; characters: number; mode: string } | null>(null);
+  const { preview, resetPreview, clearPreview, receivePreviewEvent } = useModelPreview();
   const pending = useRef(false);
   const requests = useRef(new SessionEpoch());
   const sid = useRef('');
@@ -110,7 +80,8 @@ export default function ConsultPage() {
   }
 
   useEffect(() => {
-    end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    end.current?.scrollIntoView({ behavior: reducedMotion ? 'instant' : 'smooth', block: 'end' });
   }, [turns, busy, error]);
   useEffect(() => {
     if (!handoffOpen) return;
@@ -120,19 +91,22 @@ export default function ConsultPage() {
   }, [handoffOpen]);
   useEffect(() => {
     const storedId = readStorage(browserStorage(), CONSULT_ID_KEY);
-    if (validStudioId(storedId.value)) {
-      sid.current = storedId.value;
+    const initialId = conversationId(window.location.search, storedId.value);
+    if (initialId) {
+      sid.current = initialId;
+      saveId();
       void recover();
     } else {
       sid.current = newStudioId();
       const saved = readStorage(browserStorage(), CONSULT_SESSION_KEY);
-      const decoded = decodeConsultSession(saved.value);
+      const decoded = decodeConsultSession(new URLSearchParams(window.location.search).has('chat') ? null : saved.value);
       saveTurns(decoded.turns);
       setLegacy(decoded.turns.length > 0);
       if (!saved.available) setStorageNote('浏览器未允许保存记录，刷新后可能无法找回本次咨询。');
       if (decoded.invalid) setSessionNote('此前记录无法读取，已开启新咨询。');
       else if (decoded.turns.length) setSessionNote('这是此前保存在浏览器的记录，仅供查看。开启新咨询后，旧对话不会带入。刷新不会重复发送。');
       setHydrated(true);
+      if (!decoded.turns.length) saveId();
     }
     return () => { clearTimeout(timer.current); requests.current.cancel(); };
   }, []);
@@ -143,11 +117,16 @@ export default function ConsultPage() {
     setTurns(bounded);
   }
   function saveId() {
-    if (!writeStorage(browserStorage(), CONSULT_ID_KEY, sid.current)) {
-      setStorageNote('浏览器未允许保存记录，刷新后可能无法找回本次咨询。');
+    const saved = writeStorage(browserStorage(), CONSULT_ID_KEY, sid.current);
+    const pinned = pinConversation(sid.current, window.location, window.history);
+    if (!pinned) {
+      setStorageNote(saved ? '本页对话位置未能保存，刷新后可能打开最近使用的其他咨询。' : '浏览器未允许保存记录，刷新后可能无法找回本次咨询。');
+    } else {
+      setStorageNote('');
     }
   }
   async function recover() {
+    clearPreview();
     setModelProgress(null);
     clearTimeout(timer.current);
     const task = requests.current.start();
@@ -218,6 +197,7 @@ export default function ConsultPage() {
     clearTimeout(timer.current);
     const task = requests.current.start();
     generation.current++;
+    resetPreview();
     pending.current = true;
     saveId();
     setBusy(true);
@@ -262,14 +242,18 @@ export default function ConsultPage() {
       }
       await consumeAgentStream(response, (event) => {
         if (!task.current()) return;
+        if (!receivePreviewEvent(event)) return;
         if (!cancelPending.current && event.type === 'model_progress' && typeof event.callId === 'string' && event.callId.length <= 200
           && Number.isSafeInteger(event.characters) && (event.characters as number) >= 0
           && (event.mode === 'stream' || event.mode === 'buffered')) {
           setModelProgress({ callId: event.callId, characters: event.characters as number, mode: event.mode });
         }
-        if (event.type === 'error' || event.type === 'done') setModelProgress(null);
+        if (['model_preview', 'answer', 'error', 'done'].includes(event.type)) setModelProgress(null);
         const state = parseAgentRun(event.run);
-        if (state) setRun(state);
+        if (state) {
+          setRun(state);
+          if (state.status !== 'running' || state.cancelRequested) setModelProgress(null);
+        }
         if (event.type === 'step' && typeof event.label === 'string') {
           setModelProgress(null);
           setRun((previous) => previous ? { ...previous, phase: event.label as string } : previous);
@@ -306,6 +290,7 @@ export default function ConsultPage() {
     const stoppedId = sid.current;
     const stoppedGeneration = generation.current;
     cancelPending.current = true;
+    clearPreview();
     setModelProgress(null);
     setStopping(true);
     try {
@@ -325,6 +310,7 @@ export default function ConsultPage() {
   function reset() {
     clearTimeout(timer.current);
     requests.current.cancel();
+    clearPreview();
     generation.current++;
     sid.current = newStudioId();
     saveId();
@@ -341,30 +327,89 @@ export default function ConsultPage() {
     saveTurns([]);
     setSelected(null);
     setHandoffOpen(false);
+    setPlatform('');
     setError('');
     setInput('');
-    setSessionNote('已开启新咨询，说说这次的用途和预算。');
+    setSessionNote('');
     writeStorage(browserStorage(), CONSULT_SESSION_KEY, null);
     field.current?.focus();
   }
 
+  function openConsult(id: string) {
+    if (!validStudioId(id) || id === sid.current || busy || recovering || !hydrated) return;
+    clearTimeout(timer.current);
+    requests.current.cancel();
+    clearPreview();
+    generation.current++;
+    cancelPending.current = false;
+    pending.current = false;
+    sid.current = id;
+    saveId();
+    saveTurns([]);
+    setInput('');
+    setError('');
+    setSessionNote('');
+    setRecoveryError('');
+    setLegacy(false);
+    setRun(undefined);
+    setStopping(false);
+    setTools([]);
+    setModelProgress(null);
+    setSelected(null);
+    setHandoffOpen(false);
+    setHandoffQuestions([]);
+    setIncluded([]);
+    setHandoffTask('');
+    setAudience('');
+    setConstraints('');
+    setPlatform('');
+    setHandoffError('');
+    setFallbackText('');
+    void recover();
+  }
+
   const blocked = busy || !hydrated || recovering || !!recoveryError || legacy;
   const lastFailed = !!error && turns.length > 0 && !turns.at(-1)?.answer;
+  const composer = (
+    <form className="composer consult-composer" onSubmit={(event) => {
+      event.preventDefault();
+      send(input, lastFailed && input.trim() === turns.at(-1)!.question);
+    }}>
+      <label className="sr" htmlFor="consult-input">和知选聊聊选购</label>
+      <textarea id="consult-input" ref={field} value={input} maxLength={2000} rows={2}
+        placeholder={turns.length ? '还有什么想了解的？' : '想买什么？或说说你最近的打算…'}
+        disabled={blocked} onChange={(event) => setInput(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            send(input, lastFailed && input.trim() === turns.at(-1)!.question);
+          }
+        }} />
+      <div className="composer-row"><span>{input.length ? `${input.length} / 2000` : '知选 · 选购'}</span>
+        <button className="send" type="submit" disabled={blocked || !input.trim()} aria-label={busy ? '正在咨询' : '发送咨询'}>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        </button>
+      </div>
+    </form>
+  );
   return (
     <div className="consult-shell">
+      <a className="consult-skip" href="#consult-content">跳到选购聊天</a>
       <header className="top consult-top">
-        <a className="brand consult-brand" href="/"><span className="mark">知</span>知选</a>
+        <div className="consult-identity">
+          <ChatHistory kind="consult" activeId={sid.current} disabled={busy || recovering || !hydrated} onSelect={openConsult} onNew={reset} />
+          <a className="brand consult-brand" href="/consult"><span className="mark" aria-hidden="true">知</span><span>知选<span className="consult-brand-kind">选购</span></span></a>
+        </div>
         <nav className="seg" aria-label="工作端切换">
           <a href="/">创作</a>
           <a href="/consult" className="on" aria-current="page">选购</a>
         </nav>
         <div className="top-right">
-          <button type="button" onClick={reset} disabled={!hydrated}>新咨询</button>
-          <button type="button" className="settings-trigger" disabled={busy} onClick={() => setSettings(true)}>模型设置</button>
+          <button type="button" className="settings-trigger" disabled={busy} onClick={() => setSettings(true)} aria-label="模型设置">设置</button>
         </div>
       </header>
       {settings && <ModelSettings onClose={() => setSettings(false)} />}
-      <main className={`consult-main${turns.length ? ' consult-started' : ''}`}>
+      <main id="consult-content" tabIndex={-1} className={`consult-main${turns.length ? ' consult-started' : ' consult-empty'}`}>
         <div className="session-status" aria-live="polite">
           {!hydrated || recovering ? <p role="status">正在恢复咨询记录…</p> : null}
           {recoveryError ? <p className="consult-error" role="alert">{recoveryError}<button onClick={() => { void recover(); }}>重试恢复</button></p> : null}
@@ -374,12 +419,9 @@ export default function ConsultPage() {
         </div>
         {!turns.length ? (
           <section className="consult-welcome" aria-labelledby="consult-title">
-            <span className="consult-eyebrow">从你的日常出发</span>
-            <h1 id="consult-title">先聊需求，再选产品。</h1>
-            <p>电脑、显示器、打印机或配件，从实际用途说起。<br />把事情说清楚，我们一起找到合适的方案。</p>
-            <div className="consult-prompts" aria-label="试着从这里开始">
-              {STARTERS.map((starter) => <button type="button" key={starter} onClick={() => { setInput(starter); field.current?.focus(); }}>{starter}<span aria-hidden="true">↗</span></button>)}
-            </div>
+            <span className="consult-eyebrow">知选 · 选购</span>
+            <h1 id="consult-title">想选什么？</h1>
+            <ConsultProductShowcase disabled={blocked} onChoose={text => { setInput(text); field.current?.focus(); }}>{composer}</ConsultProductShowcase>
           </section>
         ) : (
           <section className="consult-log" aria-label="咨询记录" aria-busy={busy}>
@@ -389,13 +431,12 @@ export default function ConsultPage() {
                 {turn.answer && (
                   <article className="consult-answer">
                     <div className="consult-speaker"><span className="mark" aria-hidden="true">知</span><span>选购顾问</span></div>
-                    <div className="consult-reply">{turn.answer.reply}</div>
-                    {turn.answer.retrieval && <KnowledgeRetrieval retrieval={turn.answer.retrieval} />}
+                    <div className="consult-reply"><AnswerText text={turn.answer.reply} /></div>
                     {!!turn.answer.questions?.length && (
                       <div className="consult-questions"><span>还想了解</span><ul>{turn.answer.questions.map((q, i) => <li key={i}>{q}</li>)}</ul></div>
                     )}
                     {!!turn.answer.recommendations.length && (
-                      <div className="consult-cards" aria-label="有依据的候选方案">
+                      <div className="consult-cards" aria-label="可以考虑的方案">
                         {turn.answer.recommendations.map((rec) => {
                           const evidence = turn.answer!.evidence.filter((e) => rec.evidenceIds.includes(e.id));
                           const active = selected === rec;
@@ -408,11 +449,12 @@ export default function ConsultPage() {
                               <p>{rec.reason}</p>
                               <p className="consult-tradeoff"><span>需要权衡</span>{rec.tradeoff}</p>
                               <details className="consult-evidence">
-                                <summary>查看 {evidence.length} 条依据</summary>
+                                <summary>产品资料</summary>
                                 {evidence.map((e) => (
                                   <blockquote key={e.id}>
                                     <p>{e.text}</p>
-                                    <cite>{e.id} · {e.source}<br />{e.docPath} · 第 {e.line} 行<br />读取：{e.readAt || '未记录时间'}</cite>
+                                    <cite>{e.docTitle}</cite>
+                                    {/^[a-f0-9]{24}$/.test(e.docId) ? <a href={`/api/knowledge/document?id=${e.docId}`} target="_blank" rel="noopener noreferrer">查看完整资料</a> : null}
                                   </blockquote>
                                 ))}
                               </details>
@@ -432,41 +474,21 @@ export default function ConsultPage() {
               </div>
             ))}
             {busy && <div className="consult-progress" role="status" aria-live="polite">
-              <span>{stopping ? '正在停止咨询，请等待确认' : run ? consultRunText(run) : '正在核对资料，整理适合你的方案…'}</span>
+              <span>{stopping ? '正在停止咨询，请等待确认' : '想一想，马上回复你…'}</span>
               {run?.status === 'running' && <button type="button" disabled={stopping} onClick={stop}>{stopping ? '等待确认' : '停止咨询'}</button>}
             </div>}
-            {busy && modelProgress && <p className="consult-status" role="status">{modelProgress.mode === 'stream'
-              ? `正在生成 · 已接收 ${modelProgress.characters} 字（尚未完成）` : '正在等待完整模型回复（尚未完成）'}</p>}
-            {tools.length > 0 && <ul className="consult-tools">{tools.map((tool, i) => <li key={i}>
-              <span>{tool.tool === 'model' ? '模型' : '资料'} · {tool.label}</span>
-              <span>{tool.status === 'started' ? busy ? '进行中' : '结果未确认' : tool.status === 'failed' ? '调用失败' : '已返回'}{tool.status === 'completed' && tool.cacheHit ? ' · 使用缓存' : ''}</span>
-            </li>)}</ul>}
+            {busy && <ModelPreview preview={preview} />}
             {error && <div className="consult-error" role="alert"><span>{error}</span>{lastFailed && !legacy && <button type="button" disabled={blocked} onClick={() => send(turns.at(-1)!.question, true)}>重试这条</button>}</div>}
             <div ref={end} />
           </section>
         )}
-        <div className="consult-bottom">
+        {!!turns.length && <div className="consult-bottom">
           {selected && <div className="consult-handoff"><span>已选 · {selected.modelName}</span>{selected.creativeModelId
             ? <button type="button" onClick={() => setHandoffOpen(true)}>确认创作需求 ↗</button>
             : <span>可继续咨询 · 图文素材尚未接通</span>}</div>}
-          <form className="composer consult-composer" onSubmit={(event) => {
-            event.preventDefault();
-            send(input, lastFailed && input.trim() === turns.at(-1)!.question);
-          }}>
-            <label className="sr" htmlFor="consult-input">你的任务、预算和关键软件</label>
-            <textarea id="consult-input" ref={field} value={input} maxLength={2000} rows={2}
-              placeholder={turns.length ? '补充你的需求，或继续追问…' : '例如：经常出差做方案，预算 7000，必须用 Office 和 Teams…'}
-              disabled={blocked} onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  send(input, lastFailed && input.trim() === turns.at(-1)!.question);
-                }
-              }} />
-            <div className="composer-row"><span>{input.length ? `${input.length} / 2000` : '用途 · 预算 · 软件与版本'}</span><button className="send" type="submit" disabled={blocked || !input.trim()} aria-label={busy ? '正在咨询' : '发送咨询'}>↑</button></div>
-          </form>
-          <p className="consult-note">保留最近 12 轮咨询 · 选定产品后开启独立创作<br />依据本地资料提供建议 · 软件兼容需核实 · 价格均为历史快照</p>
-        </div>
+          {composer}
+        </div>}
+        <p className="consult-note">具体配置、价格与软件支持，以所选版本及实际购买页面为准。</p>
       </main>
       {handoffOpen && selected && <div className="handoff-backdrop" onClick={() => setHandoffOpen(false)}>
         <section className="handoff-dialog" role="dialog" aria-modal="true" aria-labelledby="handoff-title" onClick={(event) => event.stopPropagation()}
@@ -480,7 +502,7 @@ export default function ConsultPage() {
             }
           }}>
           <div className="handoff-head"><h2 id="handoff-title">把需求交给创作</h2><button autoFocus type="button" onClick={() => setHandoffOpen(false)}>返回咨询</button></div>
-          <p>已选 {selected.modelName}。将开启独立创作，发送前仍可修改。产品信息会重新查证。</p>
+          <p>已选 {selected.modelName}。将开启独立创作，发送前仍可修改。</p>
           <fieldset><legend>带入哪些用户提问</legend><p>默认只带入该推荐对应的提问；可勾选相关的前文。勾选后会重新填入任务，请再编辑确认。</p>
             {handoffQuestions.map((question, index) => <label className="handoff-question" key={index}><input type="checkbox" checked={included.includes(index)}
               onChange={(event) => {

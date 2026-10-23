@@ -1,5 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { CallLog, LocalDoc, ReadResult } from '../lib/ima.ts';
@@ -13,10 +14,12 @@ function deferred() {
 }
 
 const requests: string[] = [];
+const documentTexts = new Map<string, string>();
+const failedDocuments = new Set<string>();
 const gates = new Map<string, { started: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> }>();
 const indexDoc: LocalDoc = {
   id: 'indexed-text', title: '产品事实.md', path: '模拟知识库/测试型号/产品事实.md',
-  bytes: 12, sha256: 'offline-fixture',
+  bytes: 12, sha256: createHash('sha256').update('模拟正文:indexed-text').digest('hex'),
 };
 let indexStatus = 200;
 let indexDisconnected = false;
@@ -55,7 +58,7 @@ const server = createServer(async (request, response) => {
       request.socket.destroy();
       return;
     }
-    if (id === 'http-failure' || id === 'quota') {
+    if (id === 'http-failure' || id === 'quota' || failedDocuments.has(id)) {
       response.writeHead(id === 'quota' ? 429 : 503, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: {
         kind: id === 'quota' ? 'daily_quota' : 'upstream',
@@ -65,7 +68,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     response.writeHead(200, { 'content-type': 'application/octet-stream' });
-    response.end(`模拟正文:${id}`);
+    response.end(documentTexts.get(id) ?? `模拟正文:${id}`);
     return;
   }
   response.writeHead(404);
@@ -85,6 +88,8 @@ before(async () => {
 
 beforeEach(() => {
   requests.length = 0;
+  documentTexts.clear();
+  failedDocuments.clear();
   gates.clear();
   indexStatus = 200;
   indexDisconnected = false;
@@ -113,7 +118,8 @@ async function freshClient(): Promise<ImaClient> {
 }
 
 function doc(id: string, label = `${id}.md`): LocalDoc {
-  return { id, title: label, path: `模拟知识库/${label}`, bytes: 1, sha256: 'offline-fixture' };
+  return { id, title: label, path: `模拟知识库/${label}`, bytes: 1,
+    sha256: createHash('sha256').update(documentTexts.get(id) ?? `模拟正文:${id}`).digest('hex') };
 }
 
 function hold(id: string) {
@@ -125,6 +131,146 @@ function hold(id: string) {
 function collect(entries: CallLog[]) {
   return (entry: CallLog) => { entries.push(entry); };
 }
+
+test('本地正文和图片缺失合法指纹时不请求、不命中缓存，在线来源仍独立', async t => {
+  const ima = await freshClient();
+  const request = t.mock.method(globalThis, 'fetch', async () => new Response('仅虚构在线内容'));
+  const entries: CallLog[] = [];
+  await ima.withCallScope(collect(entries), async () => {
+    for (const sha256 of ['', 'invalid', 'a'.repeat(63), 'g'.repeat(64), undefined]) {
+      const target = { ...doc('missing-fingerprint'), sha256 } as LocalDoc;
+      assert.equal((await ima.readLocalText(target)).ok, false);
+      assert.equal((await ima.readLocalImage(target)).ok, false);
+    }
+  });
+  assert.equal(request.mock.callCount(), 0);
+  assert.equal(entries.length, 10);
+  assert.ok(entries.every(entry => entry.ok === false && entry.cacheHit !== true));
+  assert.equal((await ima.readOnline('missing-fingerprint', '在线独立')).ok, true);
+});
+
+test('刷新正文绕过底层缓存，记录实际读取，新缓存随后可用', async () => {
+  const ima = await freshClient();
+  const entries: CallLog[] = [];
+  documentTexts.set('refresh-text', '旧正文');
+  const target = doc('refresh-text');
+  await ima.withCallScope(collect(entries), async () => {
+    documentTexts.set(target.id, '旧正文');
+    assert.equal((await ima.readLocalText(target)).text, '旧正文');
+    documentTexts.set(target.id, '新正文');
+    target.sha256 = doc(target.id).sha256;
+    assert.equal((await ima.readLocalText(target, { refresh: true })).text, '新正文');
+    assert.equal((await ima.readLocalText(target)).text, '新正文');
+  });
+  assert.equal(requests.filter(item => item.startsWith('/document?')).length, 2);
+  assert.deepEqual(entries.map(item => item.cacheHit === true), [false, false, true]);
+  failedDocuments.add(target.id);
+  assert.equal((await ima.readLocalText(target, { refresh: true })).ok, false);
+  assert.equal((await ima.readLocalText(target)).ok, false, '失败后不能回落到刷新前缓存');
+});
+
+test('同编号先读图片再读文字，文字仍可解码且不重复请求', async () => {
+  const ima = await freshClient();
+  documentTexts.set('image-then-text', '中文资料正文');
+  const target = doc('image-then-text');
+  documentTexts.set(target.id, '中文资料正文');
+  const image = await ima.readLocalImage(target);
+  assert.equal(image.text, undefined);
+  const text = await ima.readLocalText(target);
+  assert.equal(text.text, '中文资料正文');
+  assert.equal(requests.length, 1);
+  assert.equal(image.text, undefined, '不能修改此前交给调用方的结果');
+});
+
+test('同编号文档指纹变化后不复用旧图片，文字与图片共享对应版本字节', async () => {
+  const ima = await freshClient();
+  documentTexts.set('versioned-image', '旧图片字节');
+  const original = doc('versioned-image');
+  documentTexts.set(original.id, '旧图片字节');
+  assert.equal((await ima.readLocalImage(original)).bytes?.toString(), '旧图片字节');
+  documentTexts.set(original.id, '新图片字节');
+  const updated = doc(original.id);
+  assert.equal((await ima.readLocalImage(updated)).bytes?.toString(), '新图片字节');
+  assert.equal((await ima.readLocalText(updated)).text, '新图片字节');
+  assert.equal(requests.length, 2);
+});
+
+test('多个任务的真实读取共用总并发限制，读取正文期间也占名额', async t => {
+  const ima = await freshClient();
+  let active = 0;
+  let peak = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    active++;
+    peak = Math.max(peak, active);
+    const overloaded = active > 8;
+    return new Response(new ReadableStream({
+      start(controller) {
+        setTimeout(() => {
+          controller.enqueue(new TextEncoder().encode('虚构正文'));
+          controller.close();
+          active--;
+        }, 10);
+      },
+    }), { status: overloaded ? 503 : 200 });
+  });
+  const groups = await Promise.all(Array.from({ length: 3 }, (_, group) =>
+    ima.withCallScope(() => {}, () => Promise.all(Array.from({ length: 4 }, (_, item) =>
+      ima.readLocalText({ ...doc(`limit-${group}-${item}`), sha256: createHash('sha256').update('虚构正文').digest('hex') }))))));
+  assert.ok(groups.flat().every(result => result.ok));
+  assert.ok(peak <= 4, `并发峰值${peak}超过应用共用限制`);
+  assert.equal(active, 0);
+});
+
+test('目录刷新取得新增及移除条目，失败不继续使用旧名单', async () => {
+  const ima = await freshClient();
+  assert.equal((await ima.loadLocalIndex())[0].id, indexDoc.id);
+  indexItems = [{ ...indexDoc, id: 'new-entry' }];
+  assert.equal((await ima.loadLocalIndex({ refresh: true }))[0].id, 'new-entry');
+  indexStatus = 503;
+  await assert.rejects(ima.loadLocalIndex({ refresh: true }), /目录/);
+  await assert.rejects(ima.loadLocalIndex({ refresh: true }), /目录/);
+  indexStatus = 200;
+  indexItems = [];
+  assert.deepEqual(await ima.loadLocalIndex({ refresh: true }), []);
+});
+
+test('旧读取迟到不能覆盖刷新结果，刷新失败也不能被旧读取重新填入缓存', async (t) => {
+  for (const refreshFails of [false, true]) {
+    const ima = await freshClient();
+    const started = deferred();
+    const release = deferred();
+    let count = 0;
+    const mocked = t.mock.method(globalThis, 'fetch', async () => {
+      if (++count === 1) {
+        started.resolve();
+        await release.promise;
+        return new Response('旧正文');
+      }
+      return refreshFails ? new Response('读取失败', { status: 503 }) : new Response('刷新正文');
+    });
+    try {
+      documentTexts.set('late-read', '旧正文');
+      const old = ima.readLocalText(doc('late-read'));
+      await started.promise;
+      documentTexts.set('late-read', '刷新正文');
+      const fresh = await ima.readLocalText(doc('late-read'), { refresh: true });
+      assert.equal(fresh.ok, !refreshFails);
+      release.resolve();
+      assert.equal((await old).text, '旧正文', '发起者仍收到自己请求的实际结果');
+      const latest = await ima.readLocalText(doc('late-read'));
+      if (refreshFails) {
+        assert.equal(latest.ok, false);
+        assert.equal(count, 3, '刷新失败后应重读，不消费迟到旧缓存');
+      } else {
+        assert.equal(latest.text, '刷新正文');
+        assert.equal(count, 2, '后续应使用刷新后的缓存');
+      }
+    } finally {
+      release.resolve();
+      mocked.mock.restore();
+    }
+  }
+});
 
 test('并行请求交错完成时日志各归其主，scope 外调用仅进全局日志', async (t) => {
   const ima = await freshClient();

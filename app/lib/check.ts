@@ -45,6 +45,7 @@ export interface CheckReport {
   status: 'pass' | 'needs_fix' | 'blocked';
   issues: Issue[];
   verifiedClaimIds: string[];
+  reviewedClaimIds?: string[];
   verifiedImageIds: string[];
   checkedAt: string;
 }
@@ -58,7 +59,7 @@ type Range = [number, number];
 const FORMAT: Record<Platform, { title?: Range; lead?: Range; body?: Range; tags?: Range; emoji?: number }> = {
   公众号: { title: [18, 26], lead: [48, 64], body: [900, 1300] },
   小红书: { body: [350, 550], tags: [6, 9] },
-  朋友圈: { body: [90, 150], emoji: 3 },
+  朋友圈: { emoji: 3 },
 };
 const FIELD_LABEL = { title: '标题', lead: '导语', body: '正文' } as const;
 
@@ -66,10 +67,34 @@ export function draftFullText(d: Draft): string {
   return [d.title, d.lead, d.body, d.cta, d.tags.join(' '), ...d.images.map((i) => i.caption)].join('\n');
 }
 
+/** Same text the user copies/downloads; image captions are separate assets. */
+export function draftPublishableText(d: Draft): string {
+  return [d.title, d.lead, d.body, d.cta, d.tags.map(tag => tag.startsWith('#') ? tag : `#${tag}`).join(' ')]
+    .filter(Boolean).join('\n\n');
+}
+
+function deniedPromise(text: string, at: number): boolean {
+  const prefix = text.slice(Math.max(0, at - 40), at).split(/[。！？!?；;，,\n]/).at(-1) ?? '';
+  const denied = prefix.match(/(?:不能|不可|无法|不应(?:该)?|不要|不)(?:(?:据此|以此|用来|用于|作出|做出|轻易|直接|随意)){0,2}$/);
+  if (!denied) return false;
+  // “不能不保证 / 并非不能保证” are not denials of a guarantee.
+  const before = prefix.slice(0, denied.index);
+  return !/(?:不能|不可|无法|不应(?:该)?|不要|不|并非|不是|绝非|没有理由)(?:用来|据此|完全|一定)?$/.test(before);
+}
+
 function locate(text: string, needle: string): string {
   const i = text.indexOf(needle);
   const start = Math.max(0, i - 8);
   return text.slice(start, Math.min(text.length, i + needle.length + 8)).replace(/\n/g, ' ');
+}
+
+function ordinaryAbsoluteAdvice(text: string, word: string, at: number): boolean {
+  if (word === '最好') return /^(?:先)?(?:自己|亲自)(?:到店)?(?:确认|核对|掂|试用|试一下|看看|检查|咨询)/.test(text.slice(at + word.length));
+  if (word !== '唯一' || !/^(?:答案|选择|方案)/.test(text.slice(at + word.length))) return false;
+  const prefix = text.slice(0, at).split(/[。！？!?；;，,\n]/).at(-1) ?? '';
+  const denial = prefix.match(/(?:不要|不|别)(?:把|将)[^。！？!?；;，,\n]{0,12}(?:定成|当作|当成|作为)$/);
+  if (!denial) return false;
+  return !/(?:不能|不可|不应|并非|不是|不要|别|不)$/.test(prefix.slice(0, denial.index));
 }
 
 export function runDeterministicChecks(d: Draft, images: ImageRef[], opts: { snapshotDate?: string } = {}): CheckReport {
@@ -104,6 +129,10 @@ export function runDeterministicChecks(d: Draft, images: ImageRef[], opts: { sna
     issues.push({ type: 'format', location: loc, text: shown, reason, action: '改写', severity: 'warn' });
   const len = (s: string) => s.replace(/\s/g, '').length;
   const rule = FORMAT[d.platform];
+  if (d.platform === '朋友圈') {
+    const n = len(draftPublishableText(d));
+    if (n < 90 || n > 150) fmt('全文', `${n} 字`, '朋友圈全文建议 90-150 字（含标题、导语、结尾与标签）');
+  }
   for (const f of ['title', 'lead', 'body'] as const) {
     const r = rule[f];
     if (!r) continue;
@@ -119,13 +148,27 @@ export function runDeterministicChecks(d: Draft, images: ImageRef[], opts: { sna
   }
 
   for (const w of ABSOLUTE) {
-    if (text.includes(w)) issues.push({ type: 'absolute', location: locate(text, w), text: w, reason: '绝对化/极限用语，无法由官方资料支持', action: '改写', severity: 'block' });
+    let at = text.indexOf(w);
+    while (at >= 0) {
+      if (!ordinaryAbsoluteAdvice(text, w, at)) {
+        issues.push({ type: 'absolute', location: locate(text.slice(at), w), text: w, reason: '绝对化/极限用语，无法由官方资料支持', action: '改写', severity: 'block' });
+        break;
+      }
+      at = text.indexOf(w, at + w.length);
+    }
   }
   // “第一台/第一次/第一学期”是普通序数，只拦“行业第一/销量第一/第一品牌”这类极限表述
   const rank = text.match(/第一(?![台次天个学期步件年批眼页章课节轮周月波代项种类条点是步])/);
   if (rank) issues.push({ type: 'absolute', location: locate(text, rank[0]), text: rank[0], reason: '绝对化/极限用语，无法由官方资料支持', action: '改写', severity: 'block' });
   for (const w of PROMISE) {
-    if (text.includes(w)) issues.push({ type: 'promise', location: locate(text, w), text: w, reason: '促销/承诺类表述缺少 ima 有效依据', action: '删除', severity: 'block' });
+    let at = text.indexOf(w);
+    while (at >= 0) {
+      if (!(['保证', '承诺'].includes(w) && deniedPromise(text, at))) {
+        issues.push({ type: 'promise', location: locate(text.slice(at), w), text: w, reason: '促销/承诺类表述缺少 ima 有效依据', action: '删除', severity: 'block' });
+        break;
+      }
+      at = text.indexOf(w, at + w.length);
+    }
   }
   const fp = text.match(FIRST_PERSON);
   if (fp) issues.push({ type: 'fabricated', location: locate(text, fp[0]), text: fp[0], reason: '疑似虚构个人使用体验', action: '改写', severity: 'block' });
@@ -161,14 +204,47 @@ export function isCheckCurrent(report: CheckReport | undefined, draft: Draft): b
   return !!report && report.draftVersion === draft.version;
 }
 
+/** Older saved reports lack a coverage ledger and must be checked again before
+ * presenting a factual draft as ready. Never infer missing coverage from pass. */
+export function hasCompleteClaimReview(report: CheckReport | undefined, draft: Draft): boolean {
+  if (!report) return false;
+  if (!draft.claims.length) return true;
+  const ids = new Set(draft.claims.map(claim => claim.id));
+  const reviewed = report.reviewedClaimIds;
+  return ids.size === draft.claims.length && Array.isArray(reviewed)
+    && reviewed.length === ids.size && new Set(reviewed).size === ids.size
+    && reviewed.every(id => ids.has(id));
+}
+
+/** Unresolved factual/compliance findings cannot be downgraded to optional
+ * advice by a model's severity field. Format and other warnings keep their
+ * existing meaning. This policy also applies to unmodified saved reports. */
+export function isBlockingIssue(issue: Issue): boolean {
+  return issue.severity === 'block'
+    || ['evidence', 'conflict', 'fabricated', 'absolute'].includes(issue.type);
+}
+
+export function hasBlockingIssues(report: Pick<CheckReport, 'issues'> | undefined): boolean {
+  return !!report?.issues.some(isBlockingIssue);
+}
+
+/** Shared UI/export gate. Complete registered IDs alone do not prove that
+ * unregistered sentences were detected; this function cannot repair misses. */
+export function isPublishableReport(report: CheckReport | undefined, draft: Draft): boolean {
+  return !!report && isCheckCurrent(report, draft) && hasCompleteClaimReview(report, draft)
+    && report.status === 'pass' && !hasBlockingIssues(report);
+}
+
 export function mergeReports(det: CheckReport, ev: Omit<CheckReport, 'draftVersion' | 'checkedAt'>): CheckReport {
-  const issues = [...det.issues, ...ev.issues];
-  const blocked = issues.some((i) => i.severity === 'block');
+  const issues = [...det.issues, ...ev.issues].map((issue): Issue =>
+    isBlockingIssue(issue) && issue.severity !== 'block' ? { ...issue, severity: 'block' } : issue);
+  const blocked = hasBlockingIssues({ issues });
   return {
     draftVersion: det.draftVersion,
     status: blocked ? 'needs_fix' : 'pass',
     issues,
     verifiedClaimIds: ev.verifiedClaimIds,
+    ...(ev.reviewedClaimIds ? { reviewedClaimIds: ev.reviewedClaimIds } : {}),
     verifiedImageIds: det.verifiedImageIds,
     checkedAt: new Date().toISOString(),
   };

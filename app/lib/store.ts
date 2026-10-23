@@ -5,6 +5,8 @@ import { localImageUrl } from './ima.ts';
 import type { CheckReport, Draft } from './check.ts';
 import { SessionRepository } from './session-store.ts';
 import { isRunActive } from './agent-runtime.ts';
+import { currentSceneImages } from './supplementary-images.ts';
+import { sceneImageUrl } from './scene-images.ts';
 
 const g = globalThis as unknown as { __zx_repository?: SessionRepository };
 export const sessionRepository = (g.__zx_repository ??= new SessionRepository(
@@ -34,16 +36,21 @@ export interface SessionView {
   need?: NeedCard;
   draft?: Draft;
   report?: CheckReport;
-  evidence: { id: string; docTitle: string; section: string; text: string; kind: string; source: string; readAt: string }[];
+  evidence: { id: string; docTitle: string; section: string; text: string; kind: string; source: string; readAt: string; documentUrl?: string }[];
   images: { id: string; filename: string; purpose: string; caption: string; width: number; height: number; src: string; source: string }[];
+  supplementaryImages?: { id: string; sha256: string; caption: string; src: string; source: string }[];
 }
 
-export function toView(s: Session): SessionView {
+export function toView(s: Session, sessionId?: string): SessionView {
   return {
     need: s.need,
     draft: s.draft,
     report: s.report,
-    evidence: (s.evidence ?? []).map((e) => ({ id: e.id, docTitle: e.docTitle, section: e.section, text: e.text, kind: e.kind, source: e.source, readAt: e.readAt })),
-    images: (s.images ?? []).map((i) => ({ id: i.id, filename: i.filename, purpose: i.purpose, caption: i.caption, width: i.width, height: i.height, src: localImageUrl(i.docId), source: i.source })),
+    evidence: (s.evidence ?? []).map((e) => ({ id: e.id, docTitle: e.docTitle, section: e.section, text: e.text, kind: e.kind, source: e.source, readAt: e.readAt,
+      ...(/^[a-f0-9]{24}$/.test(e.docId) ? { documentUrl: `/api/knowledge/document?id=${e.docId}` } : {}) })),
+    images: (s.images ?? []).map((i) => ({ id: i.id, filename: i.filename, purpose: i.purpose, caption: i.caption, width: i.width, height: i.height, src: localImageUrl(i.docId, i.sha256), source: i.source })),
+    ...(sessionId && currentSceneImages(s).length ? { supplementaryImages: currentSceneImages(s).map(image => ({
+      id: image.id, sha256: image.sha256, caption: image.caption, src: sceneImageUrl(sessionId, image), source: 'AI 生成（Qwen）',
+    })) } : {}),
   };
 }

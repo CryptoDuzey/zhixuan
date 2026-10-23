@@ -1,4 +1,4 @@
-.consult-shell { --consult-paper: #fffefa; min-height: 100dvh; background: #f8f7f4; color: var(--ink); }
+.consult-shell { --consult-paper: var(--paper, #fffefa); --consult-bg: #f7f5f1; --ink: #302e2c; --ink-2: #716c66; --ink-3: #8c857c; --line: rgba(73,60,46,.12); --accent: #c53b38; min-height: 100dvh; background: var(--consult-bg); color: var(--ink); }
 .consult-top { height: 64px; border-bottom: 1px solid rgba(36,37,40,.04); }
 .consult-brand { width: fit-content; color: inherit; text-decoration: none; }
 .consult-main { width: min(840px, 100%); min-height: calc(100dvh - 64px); margin: auto; padding: 36px 28px 16px; display: flex; flex-direction: column; }
@@ -25,7 +25,7 @@
 .consult-select strong { display: block; font-size: 16px; font-weight: 600; line-height: 1.5; }
 .consult-system { color: var(--ink-2); font-size: 11px; display: block; margin-bottom: 4px; }
 .consult-check { display: grid; place-items: center; width: 25px; height: 25px; flex-shrink: 0; border: 1px solid var(--line); border-radius: 50%; color: var(--ink-2); }
-.is-selected .consult-check { background: var(--accent); color: white; border-color: var(--accent); }
+.consult-card.is-selected .consult-check { background: var(--accent); color: white; border-color: var(--accent); }
 .consult-card > p { margin: 16px 0; font-size: 13px; line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; }
 .consult-tradeoff { color: var(--ink-2); }
 .consult-tradeoff > span { display: block; color: var(--ink-3); font-size: 11px; margin-bottom: 4px; }
@@ -57,25 +57,26 @@
 .consult-handoff { display: flex; justify-content: space-between; align-items: center; gap: 14px; margin-bottom: 10px; padding: 11px 16px; border-radius: 14px; background: #efebe4; font-size: 12px; }
 .consult-handoff a { color: var(--accent); text-decoration: none; flex-shrink: 0; }
 .consult-handoff button { color: var(--accent); flex-shrink: 0; }
-.handoff-backdrop { position: fixed; inset: 0; z-index: 100; background: #25252870; display: flex; align-items: center; justify-content: center; padding: 20px; }
-.handoff-dialog { width: min(640px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto; overscroll-behavior: contain; padding: 24px; border-radius: 24px; background: #fffefa; box-shadow: 0 12px 60px #0002; font-size: 13px; line-height: 1.8; }
-.handoff-head { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
-.handoff-head h2 { font-size: 20px; margin: 0; }
-.handoff-head button { flex-shrink: 0; color: var(--ink-2); }
-.handoff-dialog fieldset { border: 1px solid var(--line); border-radius: 12px; margin: 20px 0; min-width: 0; padding: 12px; }
-.handoff-dialog fieldset p, .handoff-privacy { font-size: 12px; color: var(--ink-2); }
-.handoff-question { display: flex; align-items: start; gap: 10px; margin: 8px 0; }
-.handoff-question input { flex: none; margin-top: 6px; accent-color: var(--accent); }
-.handoff-question span { max-height: 110px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-.handoff-field { display: block; margin: 16px 0; }
-.handoff-field > span { float: right; font-size: 11px; color: var(--ink-2); }
-.handoff-field textarea, .handoff-field select { display: block; width: 100%; box-sizing: border-box; border: 1px solid var(--line); background: #fff; border-radius: 12px; padding: 10px 12px; margin-top: 6px; font: inherit; color: inherit; }
-.handoff-field textarea { resize: vertical; min-height: 60px; }
-.handoff-confirm { display: block; width: 100%; background: var(--accent); color: white; border-radius: 14px; padding: 12px; margin-top: 20px; }
-.handoff-confirm:disabled { opacity: .4; }
-@media (max-width: 600px) { .handoff-backdrop { padding: 10px; } .handoff-dialog { padding: 18px; max-height: calc(100dvh - 20px); } }
+.consult-shell .handoff-backdrop { position: fixed; inset: 0; z-index: 100; background: #25252870; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.consult-shell .handoff-dialog { width: min(640px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto; overscroll-behavior: contain; padding: 24px; border-radius: 24px; background: #fffefa; box-shadow: 0 12px 60px #0002; font-size: 13px; line-height: 1.8; }
+.consult-shell .handoff-head { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+.consult-shell .handoff-head h2 { font-size: 20px; margin: 0; }
+.consult-shell .handoff-head button { flex-shrink: 0; color: var(--ink-2); }
+.consult-shell .handoff-dialog fieldset { border: 1px solid var(--line); border-radius: 12px; margin: 20px 0; min-width: 0; padding: 12px; }
+.consult-shell .handoff-dialog fieldset p, .consult-shell .handoff-privacy { font-size: 12px; color: var(--ink-2); }
+.consult-shell .handoff-question { display: flex; align-items: start; gap: 10px; margin: 8px 0; }
+.consult-shell .handoff-question input { flex: none; margin-top: 6px; accent-color: var(--accent); }
+.consult-shell .handoff-question span { max-height: 110px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.consult-shell .handoff-field { display: block; margin: 16px 0; }
+.consult-shell .handoff-field > span { float: right; font-size: 11px; color: var(--ink-2); }
+.consult-shell .handoff-field textarea, .consult-shell .handoff-field select { display: block; width: 100%; box-sizing: border-box; border: 1px solid var(--line); background: #fff; border-radius: 12px; padding: 10px 12px; margin-top: 6px; font: inherit; color: inherit; }
+.consult-shell .handoff-field textarea { resize: vertical; min-height: 60px; }
+.consult-shell .handoff-confirm { display: block; width: 100%; background: var(--accent); color: white; border-radius: 14px; padding: 12px; margin-top: 20px; }
+.consult-shell .handoff-confirm:disabled { opacity: .4; }
+@media (max-width: 600px) { .consult-shell .handoff-backdrop { padding: 10px; } .consult-shell .handoff-dialog { padding: 18px; max-height: calc(100dvh - 20px); } }
 .consult-handoff > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .consult-status { margin: 24px 0 0; color: var(--ink-2); font-size: 13px; }
+.consult-log > .model-preview { margin-top: 20px; background: var(--consult-paper); }
 .consult-progress { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 24px; color: var(--ink-2); font-size: 13px; }
 .consult-progress button, .consult-start-new { flex: none; border: 1px solid var(--line); padding: 7px 13px; border-radius: 999px; font-size: 12px; background: var(--consult-paper); }
 .consult-tools { list-style: none; padding: 0; margin: 14px 0 0; font-size: 11px; color: var(--ink-2); }
@@ -92,4 +93,123 @@
   .consult-cards { grid-template-columns: 1fr; }
   .consult-user { max-width: 94%; }
   .consult-note { font-size: 10px; }
+}
+
+/* The discovery surface is intentionally local to /consult. Shared navigation
+   and history drawer styling remain owned by the application shell. */
+.consult-shell button { touch-action: manipulation; }
+.consult-shell :is(button, a, summary, select):focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.consult-skip { position: fixed; top: -80px; left: 20px; z-index: 120; padding: 10px 16px; background: var(--consult-paper); color: var(--ink); border-radius: 8px; }
+.consult-skip:focus { top: 12px; }
+.consult-top { min-height: 72px; height: auto; gap: 12px; padding: 12px clamp(16px, 3vw, 44px); border-bottom-color: rgba(73,60,46,.045); }
+.consult-identity { min-width: 0; display: flex; align-items: center; gap: 14px; }
+.consult-brand { flex: none; }
+.consult-brand .mark { width: 27px; height: 27px; border-radius: 9px; font-family: var(--serif); font-size: 15px; }
+.consult-brand-kind { margin-left: 10px; font-size: 11px; color: var(--ink-2); font-weight: 400; letter-spacing: .08em; }
+.consult-top .seg { background: #eae6df; padding: 3px; }
+.consult-top .seg a { padding: 5px 22px; }
+.consult-top .seg .on { background: var(--consult-paper); box-shadow: 0 2px 5px #493c2e0a; }
+.consult-top .settings-trigger { min-height: 36px; padding: 5px 12px; color: var(--ink-2); font-size: 12px; }
+.consult-main { width: min(1160px, 100%); min-height: calc(100dvh - 72px); padding: 30px 32px 18px; }
+.consult-main:focus { outline: none; }
+.consult-main.consult-started { width: min(820px, 100%); }
+.consult-main > .session-status { flex: none; }
+.consult-main > .session-status:has(p, button) { margin-bottom: 16px; }
+.consult-welcome { width: 100%; padding: 20px 0 16px; }
+.consult-eyebrow { display: inline-flex; align-items: center; gap: 10px; color: var(--ink-2); font-size: 11px; letter-spacing: .16em; }
+.consult-eyebrow::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.consult-welcome h1 { position: relative; z-index: 1; margin: 12px 0 22px; font-family: var(--serif); font-size: clamp(32px, 4vw, 46px); font-weight: 500; letter-spacing: .045em; line-height: 1.4; }
+.consult-discovery { width: 100%; }
+.consult-categories { position: relative; z-index: 1; display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.consult-categories button { min-height: 36px; padding: 7px 16px; border-radius: 999px; color: var(--ink-2); font-size: 12px; transition: color .2s, background .2s; }
+.consult-categories button:hover:not(:disabled) { color: var(--ink); background: #ece8e0; }
+.consult-categories [aria-selected='true'] { color: var(--accent); background: #c53b380b; }
+.consult-product-stage { position: relative; min-width: 0; min-height: 218px; margin: 8px auto 0; isolation: isolate; }
+.consult-artwork { position: absolute; z-index: -1; pointer-events: none; inset: -30px 3% -8px; }
+.consult-artwork::before { content: ''; position: absolute; inset: 0; background-image: var(--consult-art-image, url('/art/zhixuan-paper-ribbon.png')); background-size: cover; background-position: 50% 62%; opacity: .24; mask-image: radial-gradient(ellipse at center, #000 10%, transparent 72%); }
+.consult-artwork span { position: absolute; left: calc(50% - 48px); top: 68px; width: 96px; height: 96px; border: 1px solid #c53b3824; border-radius: 50%; transform: rotate(-24deg) scaleX(.65); }
+.consult-artwork span + span { transform: rotate(32deg) scaleX(.7); border-color: #b3a79845; }
+.consult-floating-products { display: flex; justify-content: center; align-items: center; gap: clamp(28px, 12vw, 180px); min-height: 218px; padding: 12px; }
+.consult-float-card { position: relative; display: flex; flex-direction: column; width: 214px; min-width: 0; min-height: 180px; flex: 0 1 214px; padding: 12px 15px 14px; border: 1px solid #fffefa; border-radius: 17px; background: #fffefad9; box-shadow: 0 12px 30px -14px #79644835, 0 2px 3px #79644805; text-align: left; transform: rotate(-4deg) translateY(1px); transition: transform .25s, box-shadow .25s; }
+.consult-float-card + .consult-float-card { transform: rotate(4deg) translateY(10px); }
+.consult-float-card:hover:not(:disabled), .consult-float-card:focus-visible { transform: rotate(0) translateY(-4px); box-shadow: 0 16px 32px -12px #79644840; }
+.consult-float-card:active:not(:disabled) { transform: rotate(0) translateY(-1px); }
+.consult-product-photo { display: block; width: 100%; height: 108px; object-fit: contain; mix-blend-mode: multiply; }
+.consult-product-caption { display: block; padding-top: 9px; padding-right: 10px; }
+.consult-product-caption > span { display: block; color: var(--ink-2); font-size: 10px; margin-bottom: 3px; }
+.consult-product-caption strong { display: block; font-size: 12px; line-height: 1.5; font-weight: 500; overflow-wrap: anywhere; }
+.consult-product-arrow { position: absolute; bottom: 16px; right: 12px; color: var(--ink-3); font-size: 13px; }
+.consult-product-wordmark { display: grid; min-height: 96px; place-items: center; font-size: 23px; letter-spacing: .16em; color: #b3a99c; font-weight: 500; }
+.consult-float-card.is-type-card { justify-content: space-between; background: #f0ebe3e8; }
+.consult-composer { position: relative; z-index: 2; width: min(680px, 100%); margin: 14px auto 0; padding: 18px 20px 13px; border: 1px solid #e4ded3; border-radius: 25px; background: var(--consult-paper); box-shadow: 0 10px 32px -16px #79644833; }
+.consult-composer:focus-within { border-color: #c53b3860; box-shadow: 0 10px 32px -16px #79644833, 0 0 0 3px #c53b3807; }
+.consult-composer textarea { display: block; width: 100%; min-height: 58px; max-height: 200px; padding: 0; font-size: 15px; line-height: 1.8; background: transparent; }
+.consult-composer textarea::placeholder { color: #938b81; opacity: 1; }
+.consult-composer textarea:focus-visible { outline: none; }
+.consult-composer .composer-row { align-items: flex-end; gap: 12px; min-width: 0; padding-top: 6px; font-size: 11px; color: var(--ink-3); }
+.consult-composer .composer-row > span { min-width: 0; padding-bottom: 6px; }
+.consult-composer .send { flex: 0 0 36px; width: 36px; height: 36px; min-width: 36px; background: var(--accent); transition: background .2s, transform .2s; }
+.consult-composer .send:hover:not(:disabled) { background: #ac302d; transform: translateY(-1px); }
+.consult-question-carousel { width: min(630px, 100%); display: grid; grid-template-columns: 36px minmax(0, 1fr) 36px; gap: 12px; align-items: start; margin: 20px auto 0; }
+.consult-question-cycle { width: 36px; min-height: 36px; border-radius: 50%; color: var(--ink-2); transition: background .2s; }
+.consult-question-cycle:hover:not(:disabled) { background: #ece7de; }
+.consult-question-current { min-width: 0; }
+.consult-question-current > button { min-height: 36px; padding: 6px 4px; color: var(--ink-2); font-size: 12px; line-height: 1.8; text-wrap: pretty; }
+.consult-question-current > button:hover:not(:disabled) { color: var(--ink); }
+.consult-question-current > button > span { display: inline-block; margin-left: 8px; color: var(--ink-3); }
+.consult-question-count { display: block; padding-top: 3px; color: var(--ink-3); font-size: 9px; letter-spacing: .12em; font-variant-numeric: tabular-nums; }
+.consult-note { flex: none; color: var(--ink-3); font-size: 10px; line-height: 1.8; margin: 14px 0 0; }
+.consult-user { background: #ebe6dd; border-color: transparent; line-height: 1.8; }
+.consult-reply a { color: var(--accent); text-underline-offset: 3px; }
+.consult-card { border-color: #e5ded2; border-radius: 18px; }
+.consult-evidence a { display: inline-block; margin-top: 5px; color: var(--accent); text-underline-offset: 3px; }
+.consult-bottom { z-index: 3; padding: 10px 0 6px; background: linear-gradient(transparent, var(--consult-bg) 18px); }
+.consult-bottom .consult-composer { width: 100%; margin-top: 8px; }
+.consult-handoff { background: #ebe5db; }
+.consult-progress button, .consult-start-new { min-height: 36px; }
+.consult-error { overflow-wrap: anywhere; color: #a63230; background: #f3e6e0; }
+.consult-error button { min-height: 30px; text-underline-offset: 3px; }
+@media (min-width: 760px) and (min-height: 800px) { .consult-empty .consult-welcome { padding-bottom: 50px; } }
+@media (max-width: 700px) {
+  .consult-top { grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; min-height: 64px; padding: 10px 16px; }
+  .consult-identity { gap: 8px; }
+  .consult-brand-kind { display: none; }
+  .consult-top .seg a { padding: 5px 15px; font-size: 12px; }
+  .consult-top .top-right { gap: 0; font-size: 12px; }
+  .consult-top .settings-trigger { padding-inline: 6px; }
+  .consult-main { min-height: calc(100dvh - 64px); padding: 24px 20px 14px; }
+  .consult-welcome { padding: 16px 0 20px; }
+  .consult-welcome h1 { margin-bottom: 18px; }
+  .consult-floating-products { gap: 36px; min-height: 200px; padding-inline: 8px; }
+  .consult-product-stage { min-height: 200px; }
+  .consult-float-card { flex-basis: 190px; min-height: 166px; padding: 10px 12px; }
+  .consult-product-photo { height: 90px; }
+  .consult-product-wordmark { min-height: 80px; font-size: 20px; }
+  .consult-artwork { inset-inline: 0; }
+  .consult-composer { margin-top: 14px; padding: 16px 17px 12px; border-radius: 22px; }
+  .consult-composer textarea { font-size: 16px; }
+  .consult-question-carousel { gap: 5px; margin-top: 18px; }
+  .consult-cards { grid-template-columns: minmax(0, 1fr); }
+  .consult-note { font-size: 10px; }
+}
+@media (max-width: 390px) {
+  .consult-top { padding-inline: 12px; gap: 4px; }
+  .consult-brand { font-size: 13px; gap: 5px; }
+  .consult-brand .mark { width: 23px; height: 23px; font-size: 13px; }
+  .consult-identity { gap: 5px; }
+  .consult-top .seg a { padding-inline: 10px; }
+  .consult-main { padding-inline: 16px; }
+  .consult-categories { gap: 0; }
+  .consult-categories button { padding-inline: 13px; }
+  .consult-floating-products { gap: 22px; padding-inline: 5px; }
+  .consult-float-card { min-height: 158px; padding: 10px; }
+  .consult-product-photo { height: 78px; }
+  .consult-product-caption strong { font-size: 11px; }
+  .consult-product-arrow { right: 8px; bottom: 12px; }
+  .consult-question-carousel { grid-template-columns: 30px minmax(0, 1fr) 30px; }
+  .consult-question-cycle { width: 30px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .consult-shell *, .consult-shell *::before, .consult-shell *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .consult-float-card, .consult-float-card + .consult-float-card, .consult-float-card:hover:not(:disabled), .consult-float-card:focus-visible { transform: none; }
 }

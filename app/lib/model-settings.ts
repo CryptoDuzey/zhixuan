@@ -19,6 +19,16 @@ export interface ModelSettingsInput {
   model?: string;
 }
 
+/** DeepSeek enables thinking by default; its hidden tokens share max_tokens.
+ * Interactive JSON calls need the full output budget for the actual answer.
+ * Do not send provider-specific parameters to unrelated compatible gateways.
+ */
+export function completionOptions(settings: Pick<ModelSettings, 'baseUrl'>, model: string, reasoning?: 'low'): { thinking?: { type: 'disabled' | 'enabled' }; reasoning_effort?: 'low' } {
+  const host = new URL(settings.baseUrl).hostname;
+  return host === 'api.deepseek.com' && /^(deepseek-flash|deepseek-v4-pro)$/.test(model)
+    ? reasoning ? { thinking: { type: 'enabled' }, reasoning_effort: reasoning } : { thinking: { type: 'disabled' } } : {};
+}
+
 /** Only deliberate, public error messages may reach the API or call history. */
 export class ModelSettingsError extends Error {
   readonly status: number;
@@ -186,7 +196,13 @@ async function quotaFailure(response: Response): Promise<boolean> {
 }
 
 /** No retry and no redirect: one user action creates at most one gateway request. */
-export async function fetchModelGateway(settings: ModelSettings, endpoint: 'models' | 'chat/completions', options: RequestInit = {}, timeoutMs = 15_000): Promise<unknown> {
+export async function consumeModelGateway<T>(
+  settings: ModelSettings,
+  endpoint: 'models' | 'chat/completions',
+  options: RequestInit,
+  timeoutMs: number,
+  consume: (response: Response, signal: AbortSignal) => Promise<T>,
+): Promise<T> {
   requireApiKey(settings);
   const controller = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
@@ -207,10 +223,12 @@ export async function fetchModelGateway(settings: ModelSettings, endpoint: 'mode
       throw new ModelSettingsError(status, `模型网关返回 HTTP ${response.status}，请检查密钥、模型和网关状态。`);
     }
     try {
-      return await response.json();
-    } catch {
-      if (controller.signal.aborted) throw new ModelSettingsError(504, '模型网关响应超时，请稍后重试。');
-      throw new ModelSettingsError(502, '模型网关返回了无法识别的响应。');
+      return await consume(response, signal);
+    } catch (error) {
+      // Preserve only deliberately safe errors from a bounded response decoder.
+      // Other exceptions may contain gateway content or credentials.
+      if (signal.aborted) throw signal.reason;
+      throw error instanceof ModelSettingsError ? error : new ModelSettingsError(502, '模型网关返回了无法识别的响应。');
     }
   } catch (error) {
     if (options.signal?.aborted) throw options.signal.reason;
@@ -219,6 +237,17 @@ export async function fetchModelGateway(settings: ModelSettings, endpoint: 'mode
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** JSON probes retain their existing single-request behavior. */
+export async function fetchModelGateway(settings: ModelSettings, endpoint: 'models' | 'chat/completions', options: RequestInit = {}, timeoutMs = 15_000): Promise<unknown> {
+  return consumeModelGateway(settings, endpoint, options, timeoutMs, async (response) => {
+    try {
+      return await response.json();
+    } catch {
+      throw new ModelSettingsError(502, '模型网关返回了无法识别的响应。');
+    }
+  });
 }
 
 export async function listGatewayModels(settings: ModelSettings): Promise<string[]> {
@@ -237,10 +266,15 @@ export async function listGatewayModels(settings: ModelSettings): Promise<string
 export async function testGatewayModel(settings: ModelSettings) {
   const response = await fetchModelGateway(settings, 'chat/completions', {
     method: 'POST',
-    body: JSON.stringify({ model: settings.model, messages: [{ role: 'user', content: 'Reply only OK.' }], max_tokens: 16 }),
-  }) as { choices?: { message?: { content?: unknown } }[] } | null;
-  const content = response?.choices?.[0]?.message?.content;
+    body: JSON.stringify({ model: settings.model, messages: [{ role: 'user', content: 'Reply only OK.' }], max_tokens: 16, ...completionOptions(settings, settings.model) }),
+  }) as { error?: unknown; choices?: { finish_reason?: unknown; message?: { content?: unknown; tool_calls?: unknown; function_call?: unknown } }[] } | null;
+  const choice = response?.choices?.[0];
+  if (response?.error || (choice?.finish_reason != null && choice.finish_reason !== 'stop')
+    || choice?.message?.tool_calls || choice?.message?.function_call) {
+    throw new ModelSettingsError(502, '模型测试回复未完整结束，请检查模型状态后重试。');
+  }
+  const content = choice?.message?.content;
   if (typeof content !== 'string' || !content.trim()) throw new ModelSettingsError(502, '模型网关没有返回有效的测试回复。');
   // A gateway can echo credentials even in a successful reply; expose only status.
-  return { ok: true, model: settings.model, message: '连接成功，已收到模型测试回复。' };
+  return { ok: true, model: settings.model, message: '短回复测试通过；完整创作仍需实际发送验证，额度与模型状态可能变化。' };
 }

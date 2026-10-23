@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { checkClaimRefs, createDraft, dedupeByContainment, editDraft, handleMessage, newSession, reviseDraft, selectEvidence, understandPrompt, verifyEvidence, writeFromNeed, type AgentEvent, type AgentSources, type NeedCard, type Session } from '../lib/agent.ts';
 import { ambiguousModel, type Evidence, type ImageRef, type ModelEntry } from '../lib/facts.ts';
 import type { Draft } from '../lib/check.ts';
+import { reviewFixture } from './claim-review-fixture.ts';
 
 const ev = (id: string, kind: Evidence['kind'], docTitle: string): Evidence => ({
   id, docId: 'd', docTitle, docPath: 'p', line: 1, section: '', text: id, kind, source: '本地已下载知识库', readAt: '',
@@ -111,7 +112,7 @@ function offlineTransport(t: TestContext, mode: 'clarify' | 'write' = 'clarify',
     const data = system.includes('需求理解模块')
       ? mode === 'write' ? readyNeed() : { ...readyNeed(), platform: null, next_action: 'clarify', question: '想发在哪个平台？' }
       : system.includes('严格的事实核验模块')
-        ? { issues: [], verified_claim_ids: ['C1'] }
+        ? reviewFixture(request.messages[1].content)
         : {
           title: '本轮产品文案', lead: '', body: '本轮有依据的产品介绍。', cta: '请以官网规格页为准', tags: [],
           claims: [{ id: 'C1', text: '本轮有依据的产品介绍。', factIds: ['E001'] }],
@@ -472,6 +473,74 @@ test('核验按图片编号使用人工画面描述，未复核索引不再享�
   assert.match(prompt, /图注：\[IMG1\] 学生正在使用协同功能/);
   assert.doesNotMatch(prompt, /视为有依据，不要当作虚构/);
 });
+
+test('真实漏审结构触发一次补查，已审主张与原问题保留', async (t) => {
+  const transport = offlineTransport(t);
+  const known = { type: 'evidence', location: '正文', text: '其他未登记主张', reason: '需要条件', action: '补充条件', severity: 'warn' };
+  const responses = [
+    { issues: [known], verified_claim_ids: ['C1'] },
+    { claim_checks: [{ id: 'C2', verdict: 'unsupported', evidence_ids: ['E001'], reason: '重量不能证明背负感受' }], issues: [] },
+  ];
+  transport.mock.mockImplementation(async () => Response.json({ choices: [{ message: { content: JSON.stringify(responses.shift()) } }] }));
+  const d = draft([{ id: 'C1', text: '标准屏版798 g', factIds: ['E001'] }, { id: 'C2', text: '背一天没有负担', factIds: ['E001'] }]);
+  const result = await verifyEvidence(d, ALL);
+  assert.equal(transport.mock.callCount(), 2);
+  assert.equal(result.status, 'needs_fix');
+  assert.deepEqual(result.reviewedClaimIds, ['C1', 'C2']);
+  assert.deepEqual(result.verifiedClaimIds, ['C1']);
+  assert.ok(result.issues.some(issue => issue.text === known.text));
+  assert.ok(result.issues.some(issue => issue.text === d.claims[1].text && issue.severity === 'block'));
+});
+
+test('补查把普通建议单独处置，二次仍漏项则失败而非假通过', async (t) => {
+  const transport = offlineTransport(t);
+  const d = draft([{ id: 'C1', text: '先问老师课程软件要求', factIds: ['E001'] }]);
+  const responses = [
+    { issues: [] },
+    { claim_checks: [{ id: 'C1', verdict: 'advice', evidence_ids: [], reason: '这是行动建议，不是兼容结论' }], issues: [] },
+    { issues: [], verified_claim_ids: [] },
+    { claim_checks: [], issues: [] },
+  ];
+  transport.mock.mockImplementation(async () => Response.json({ choices: [{ message: { content: JSON.stringify(responses.shift()) } }] }));
+  const result = await verifyEvidence(d, ALL);
+  assert.equal(result.status, 'pass');
+  assert.deepEqual(result.verifiedClaimIds, []);
+  assert.deepEqual(result.reviewedClaimIds, ['C1']);
+  await assert.rejects(() => verifyEvidence(d, ALL), /检查暂时没完成/);
+  assert.equal(transport.mock.callCount(), 4);
+});
+
+test('正文上限超出时仅精简一次，最终版本加一且原图不变', async (t) => {
+  const transport = offlineTransport(t);
+  const s = completedSession();
+  s.images = [image('IMG1', true)];
+  s.draft!.images = [{ imageId: 'IMG1', position: '正文后', caption: '产品配图' }];
+  const candidate = (count: number) => ({ title: '小组报告', lead: '', body: '字'.repeat(count), cta: '', tags: [],
+    images: s.draft!.images, claims: [{ id: 'C1', text: '离线正文', factIds: ['E001'] }] });
+  const packets = [candidate(172), { ...candidate(100), images: [] }, { issues: [], verified_claim_ids: ['C1'] }];
+  transport.mock.mockImplementation(async () => Response.json({ choices: [{ message: { content: JSON.stringify(packets.shift()) } }] }));
+  await reviseDraft('正文缩到120字以内', s, () => {}, mockSources(t));
+  assert.equal(transport.mock.callCount(), 3);
+  assert.equal(s.draft!.version, 2);
+  assert.equal(s.draft!.body.length, 100);
+  assert.equal(s.draft!.images[0]?.imageId, 'IMG1');
+  assert.equal(s.report?.draftVersion, 2);
+});
+
+test('精简仍超长时不再循环，也不覆盖原稿或旧检查', async (t) => {
+  const transport = offlineTransport(t);
+  const s = completedSession();
+  s.images = [image('IMG1', true)];
+  s.draft!.images = [{ imageId: 'IMG1', position: '正文后', caption: '产品配图' }];
+  const before = structuredClone(s);
+  const data = { title: '', lead: '', body: '字'.repeat(172), cta: '', tags: [], images: [], claims: [] };
+  transport.mock.mockImplementation(async () => Response.json({ choices: [{ message: { content: JSON.stringify(data) } }] }));
+  await assert.rejects(() => reviseDraft('正文缩到120字以内', s, () => {}, mockSources(t)), /原稿已保留/);
+  assert.equal(transport.mock.callCount(), 2);
+  assert.deepEqual(s.draft, before.draft);
+  assert.deepEqual(s.report, before.report);
+});
+
 
 test('改稿的图片选择也遵守人工复核优先规则，避免先写出错误图注', async (t) => {
   const transport = offlineTransport(t);

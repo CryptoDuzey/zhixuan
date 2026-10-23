@@ -1,5 +1,6 @@
 import { beforeEach, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,6 +42,20 @@ function service(output: unknown = data(), overrides: Partial<ConsultDependencie
     ...overrides,
   };
 }
+
+test('问Pro S不能把前缀相同的Pro强行加入候选，更不能报Pro的价格', async () => {
+  const read: string[] = [];
+  const deps = service(undefined, {
+    loadCatalog: async () => [
+      { id: 'pro', name: 'HUAWEI MateBook Pro', category: '电脑', level: 'full' },
+      { id: 'pro-s', name: 'HUAWEI MateBook Pro S', category: '电脑', level: 'full' },
+    ],
+    loadCatalogEvidence: async id => { read.push(id); return [ev(`${id}-fact`, id)]; },
+    generate: async (_messages, purpose) => purpose === 'routing' ? { candidateIds: ['pro-s'], reply: '' } : data(),
+  });
+  await consult(ask('华为 MateBook Pro S 多少钱？我问的就是价格，不需要先问用途。'), deps);
+  assert.deepEqual(read, ['pro-s']);
+});
 
 test('短招呼调用模型自然回应，不读取目录、事实或检索资料', async () => {
   for (const greeting of ['你好', '你好呀！', 'hi', '在吗？', '我想买一台电脑', '帮我选电脑']) {
@@ -255,7 +270,7 @@ test('明确否定讨论或报价不会触发快照，后说不报价也生效�
     const answer = await consult(ask(question), service(data(), {
       loadEvidence: async (id) => [ev(`${id}-fact`, id), ev(`${id}-price`, id, 'price', '2026-10-17 16GB+1TB：6999元')],
       generate: async (messages) => {
-        assert.match(messages[0].content, /400—700字/);
+        assert.match(messages[0].content, /120—300字/);
         assert.match(messages[0].content, /像朋友/);
         assert.match(messages[0].content, /用户没有问价格/);
         return { ...data(), reply: '先从你的实际工作流程出发，核实软件和外设。'.repeat(80) };
@@ -444,7 +459,7 @@ function mockNetwork(t: TestContext, failure = false) {
     }
     assert.equal(target.origin, new URL(process.env.IMA_BASE ?? 'http://127.0.0.1:8765').origin, 'only the configured knowledge service may be mocked');
     knowledgeCalls++;
-    if (target.pathname === '/documents') return Response.json({ items: docs.map((d) => ({ ...d, title: d.id, bytes: d.value.length, sha256: 'offline' })) });
+    if (target.pathname === '/documents') return Response.json({ items: docs.map((d) => ({ ...d, title: d.id, bytes: d.value.length, sha256: createHash('sha256').update(d.value).digest('hex') })) });
     if (target.pathname === '/document') {
       const doc = docs.find((d) => d.id === target.searchParams.get('id'));
       assert.ok(doc, `unexpected document ${target.searchParams.get('id')}`);

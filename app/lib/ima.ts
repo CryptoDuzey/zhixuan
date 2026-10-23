@@ -1,5 +1,7 @@
 // ima 客户端：在线/本地分源、配额识别、缓存、调用留痕。不接触任何密钥（服务端持有）。
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
+import { knowledgeReads } from './knowledge-queue.ts';
 import { abortableDelay, reportTool, runSignal, throwIfStopped } from './agent-runtime.ts';
 
 const BASE = process.env.IMA_BASE ?? 'http://127.0.0.1:8765';
@@ -40,7 +42,9 @@ const BACKSLASH = String.fromCharCode(92);
 const globalLog: CallLog[] = [];
 const callScope = new AsyncLocalStorage<(entry: CallLog) => void>();
 const readCache = new Map<string, ReadResult>();
+const latestReads = new Map<string, object>();
 let localIndex: LocalDoc[] | null = null;
+let latestIndexRead: object | undefined;
 let localIndexOk = false;
 let quotaExhausted = false;
 
@@ -80,8 +84,11 @@ async function getJson(url: string): Promise<any> {
   for (let attempt = 0; attempt < 3; attempt++) {
     throwIfStopped();
     try {
-      const r = await fetch(url, { cache: 'no-store', signal: requestSignal() });
-      const t = await r.text();
+      const signal = requestSignal();
+      const { r, t } = await knowledgeReads.run(signal, async () => {
+        const r = await fetch(url, { cache: 'no-store', signal });
+        return { r, t: await r.text() };
+      });
       throwIfStopped();
       try {
         return { status: r.status, json: JSON.parse(t) };
@@ -103,28 +110,43 @@ function requestSignal() {
   return parent ? AbortSignal.any([parent, timeout]) : timeout;
 }
 
-export async function loadLocalIndex(): Promise<LocalDoc[]> {
+export async function loadLocalIndex(options?: { refresh?: boolean }): Promise<LocalDoc[]> {
   throwIfStopped();
+  if (options?.refresh) {
+    localIndex = null;
+    localIndexOk = false;
+  }
   if (localIndex?.length) {
     log({ op: 'documents', target: '/documents', ok: localIndexOk, source: '本地已下载知识库', cacheHit: true, note: `${localIndex.length} 项（缓存命中，未发起 HTTP 请求）` });
     return localIndex;
   }
+  const request = {};
+  latestIndexRead = request;
   try {
     const { status, json } = await getJson(`${BASE}/documents`);
     const items: any[] = json?.items ?? [];
-    localIndex = items.map((x) => ({
+    if (options?.refresh && (status < 200 || status >= 300 || !Array.isArray(json?.items))) {
+      throw new Error('知识库目录刷新失败，请稍后重试。');
+    }
+    const index = items.map((x) => ({
       id: x.id,
       title: x.title,
       path: String(x.path).split(BACKSLASH).join('/'),
       bytes: x.bytes,
       sha256: x.sha256,
     }));
-    localIndexOk = status >= 200 && status < 300 && localIndex.length > 0;
-    log({ op: 'documents', target: '/documents', ok: localIndexOk, source: '本地已下载知识库', note: `${localIndex.length} 项` });
-    return localIndex;
+    const ok = status >= 200 && status < 300 && index.length > 0;
+    if (latestIndexRead === request) {
+      localIndex = index;
+      localIndexOk = ok;
+    }
+    log({ op: 'documents', target: '/documents', ok, source: '本地已下载知识库', note: `${index.length} 项` });
+    return index;
   } catch (e) {
     log({ op: 'documents', target: '/documents', ok: false, source: '本地已下载知识库', note: String(e instanceof Error ? e.message : e) });
     throw e;
+  } finally {
+    if (latestIndexRead === request) latestIndexRead = undefined;
   }
 }
 
@@ -168,18 +190,33 @@ function detectQuota(status: number, buf: Buffer): ReadResult['error'] | undefin
   return status >= 400 ? { message: `HTTP ${status}` } : undefined;
 }
 
-async function readRaw(id: string, source: SourceKind, label: string, op: 'read' | 'image'): Promise<ReadResult> {
-  const cacheKey = `${source}|${id}`;
+async function readRaw(id: string, source: SourceKind, label: string, op: 'read' | 'image', refresh = false, fingerprint = ''): Promise<ReadResult> {
+  if (source === '本地已下载知识库' && !/^[a-f0-9]{64}$/i.test(fingerprint)) {
+    log({ op, target: label, ok: false, source, note: '本地资料缺少有效内容指纹，未读取' });
+    return { ok: false, source, readAt: new Date().toISOString(), error: { message: '资料缺少有效文件版本，请刷新知识库后重试。' } };
+  }
+  const cacheKey = JSON.stringify([source, id, fingerprint]);
+  if (refresh) readCache.delete(cacheKey);
   const hit = readCache.get(cacheKey);
   if (hit?.ok) {
     log({ op, target: label, ok: true, source, bytes: hit.bytes?.length, cacheHit: true, note: '缓存命中，未发起 HTTP 读取' });
+    if (op === 'read' && hit.text === undefined && hit.bytes) {
+      const decoded = { ...hit, text: hit.bytes.toString('utf8') };
+      readCache.set(cacheKey, decoded);
+      return decoded;
+    }
     return hit;
   }
   const readAt = new Date().toISOString();
+  const request = {};
+  latestReads.set(cacheKey, request);
   try {
     throwIfStopped();
-    const r = await fetch(`${BASE}/document?id=${encodeURIComponent(id)}`, { cache: 'no-store', signal: requestSignal() });
-    const buf = Buffer.from(await r.arrayBuffer());
+    const signal = requestSignal();
+    const { r, buf } = await knowledgeReads.run(signal, async () => {
+      const r = await fetch(`${BASE}/document?id=${encodeURIComponent(id)}`, { cache: 'no-store', signal });
+      return { r, buf: Buffer.from(await r.arrayBuffer()) };
+    });
     throwIfStopped();
     const err = detectQuota(r.status, buf);
     if (err || !r.ok) {
@@ -187,19 +224,27 @@ async function readRaw(id: string, source: SourceKind, label: string, op: 'read'
       log({ op, target: label, ok: false, source, note: err ? `${err.kind ?? ''} ${err.code ?? ''}`.trim() : `HTTP ${r.status}` });
       return { ok: false, source, readAt, error: err ?? { message: `HTTP ${r.status}` } };
     }
+    if (/^[a-f0-9]{64}$/i.test(fingerprint) && createHash('sha256').update(buf).digest('hex') !== fingerprint.toLowerCase()) {
+      log({ op, target: label, ok: false, source, note: '返回文件与目录内容指纹不一致，未缓存' });
+      return { ok: false, source, readAt, error: { message: '资料内容已变化，请刷新后重试。' } };
+    }
     const res: ReadResult = { ok: true, source, readAt, bytes: buf, text: op === 'read' ? buf.toString('utf8') : undefined };
-    readCache.set(cacheKey, res);
+    // A slower earlier request may still serve its caller, but cannot overwrite
+    // a newer refresh (or repopulate invalidated data after that refresh fails).
+    if (latestReads.get(cacheKey) === request) readCache.set(cacheKey, res);
     log({ op, target: label, ok: true, source, bytes: buf.length });
     return res;
   } catch (e: any) {
     throwIfStopped();
     log({ op, target: label, ok: false, source, note: String(e?.message ?? e) });
     return { ok: false, source, readAt, error: { message: String(e?.message ?? e) } };
+  } finally {
+    if (latestReads.get(cacheKey) === request) latestReads.delete(cacheKey);
   }
 }
 
-export const readLocalText = (doc: LocalDoc) => readRaw(doc.id, '本地已下载知识库', doc.path, 'read');
-export const readLocalImage = (doc: LocalDoc) => readRaw(doc.id, '本地已下载知识库', doc.path, 'image');
+export const readLocalText = (doc: LocalDoc, options?: { refresh?: boolean }) => readRaw(doc.id, '本地已下载知识库', doc.path, 'read', options?.refresh, doc.sha256);
+export const readLocalImage = (doc: LocalDoc) => readRaw(doc.id, '本地已下载知识库', doc.path, 'image', false, doc.sha256);
 
 /** 在线读取：配额耗尽后不再尝试，调用方降级到本地并如实标注。 */
 export async function readOnline(onlineId: string, label: string, op: 'read' | 'image' = 'read'): Promise<ReadResult> {
@@ -210,6 +255,6 @@ export async function readOnline(onlineId: string, label: string, op: 'read' | '
   return readRaw(onlineId, 'ima 在线 API', label, op);
 }
 
-export function localImageUrl(docId: string) {
-  return `/api/image?id=${encodeURIComponent(docId)}`;
+export function localImageUrl(docId: string, sha256?: string) {
+  return `/api/image?id=${encodeURIComponent(docId)}${sha256 ? `&version=${encodeURIComponent(sha256)}` : ''}`;
 }

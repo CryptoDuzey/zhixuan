@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { IMAGE_RANGE, type Platform } from '../lib/check.ts';
 import { PLATFORM_SPEC, REQUIRED_FOOTER, SYSTEM_PROMPT } from '../lib/prompts.ts';
+import { MARKETING_SCENARIO_GUIDANCE, buildMarketingPlatformGuidance } from '../lib/scenario-guidance.ts';
 
 test('平台长度、段落、配图及尾注契约保持原规格', () => {
   assert.deepEqual(Object.keys(PLATFORM_SPEC).sort(), ['公众号', '小红书', '朋友圈'].sort());
@@ -21,7 +22,7 @@ test('平台长度、段落、配图及尾注契约保持原规格', () => {
   assert.match(PLATFORM_SPEC.公众号, /图注 18-36 字/);
   assert.match(PLATFORM_SPEC.朋友圈, /全文 90-150 字/);
   assert.match(PLATFORM_SPEC.朋友圈, /至多 3 个参数.*版本条件.*不超过 3 个/);
-  assert.equal(REQUIRED_FOOTER, '不同销售版本配置可能不同，请以华为官方规格页及实际销售 SKU 为准。');
+  assert.equal(REQUIRED_FOOTER, '不同版本配置可能不同，购买前请确认对应的官方规格。');
 });
 
 // 这层只防止编辑要求意外删掉关键边界，不宣称模型已经遵守或文案质量已提升。
@@ -146,7 +147,9 @@ test('六种任务经真实写稿和改稿入口保留平台、阶段、证据�
     for (const result of results) {
       const platform = result.scenario.platform as Platform;
       for (const messages of [result.write, result.revise]) {
-        assert.equal(messages[0].content, SYSTEM_PROMPT);
+        assert.ok(messages[0].content.startsWith(SYSTEM_PROMPT));
+        assert.ok(messages[0].content.includes(MARKETING_SCENARIO_GUIDANCE));
+        assert.ok(messages[0].content.includes(buildMarketingPlatformGuidance(platform)));
         const user = messages[1].content as string;
         for (const required of [
           PLATFORM_SPEC[platform], REQUIRED_FOOTER, result.scenario.scene,

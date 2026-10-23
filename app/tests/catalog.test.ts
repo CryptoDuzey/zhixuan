@@ -130,6 +130,18 @@ test('反斜杠和根前缀可用，外部修改返回值不污染缓存', async
   assert.equal(again[0].evidencePaths.length, 1);
 });
 
+test('明确刷新证据时重新读取正文，失败不退回旧缓存', async () => {
+  const f = fixture();
+  f.add('a', cardPath('新品'), '# 新品\n旧正文');
+  await f.loadCatalog();
+  f.texts.set('a', '# 新品\n新正文');
+  const updated = await f.loadCatalogEvidence('catalog:a', { refresh: true });
+  assert.ok(updated.some(item => item.text.includes('新正文')));
+  assert.ok(!updated.some(item => item.text.includes('旧正文')));
+  f.texts.delete('a');
+  await assert.rejects(f.loadCatalogEvidence('catalog:a', { refresh: true }), /读取目录资料失败/);
+});
+
 test('未知ID拒绝，不允许传入任意资料路径', async () => {
   const f = fixture();
   f.add('a', cardPath('新品'), '# 新品\n- 产品类别：显示器');
@@ -184,4 +196,75 @@ test('55张发现卡及完整资料按最多4个并发读取，同时请求目�
   assert.ok(evidence.length > 0);
   assert.ok(evidence.every((e) => e.docId === 'card-55' && e.kind === 'limit'));
   assert.equal(f.reads.length, 77, 'cached evidence must not start another document read');
+});
+
+const pricePath = (name: string) => `${root}08-官方公开价格快照/01-消费级PC/${name}-价格卡.md`;
+const priceText = (name: string) => `---\nproduct_name: ${name}\n---\n# ${name}｜官方公开价格卡\n## 官方价格与销售状态记录\n| 核验时间 | 精确款式 | 价格类型 | 页面金额 | 参考/划线金额 | 库存或销售状态 | 条件摘要 | 来源 |\n|---|---|---|---|---|---|---|---|\n| 2026-10-17T14:51:00-05:00 | 24GB/512GB/柔光版/仲夏紫/HarmonyOS/麒麟XE90 | 官方商城页面价 | ¥9,999 | — | 现货 | 未核验结算价 | [官方页](https://item.vmall.com/product/1) |`;
+
+test('价格按产品全名绑定，无创作映射也可读取，原事实编号和正文不变', async () => {
+  const f = fixture();
+  const name = '华为无线鼠标 3';
+  f.add('mouse', cardPath(name), `# ${name}\n- 产品类别：鼠标`);
+  const before = await f.loadCatalogEvidence('catalog:mouse');
+  const g = fixture();
+  g.add('mouse', cardPath(name), `# ${name}\n- 产品类别：鼠标`);
+  g.add('price', pricePath(name), priceText(name));
+  const entry = (await g.loadCatalog())[0];
+  assert.ok(entry.evidencePaths.includes(pricePath(name)));
+  assert.deepEqual(await g.loadCatalogEvidence(entry.id), before);
+  assert.ok(!g.reads.includes('price'), '默认非询价不读价格正文');
+  const withPrice = await g.loadCatalogEvidence(entry.id, { wantPrice: true });
+  assert.deepEqual(withPrice.slice(0, before.length), before);
+  assert.ok(withPrice.slice(before.length).every(e => e.kind === 'price' && !e.text.includes('仅供产品发现')));
+  assert.ok(withPrice.some(e => e.docId === 'price' && e.kind === 'price'));
+  assert.equal(new Set(withPrice.map(e => e.id)).size, withPrice.length);
+});
+
+test('价格保留鸿蒙/Windows、企业/消费款、代际款式边界，不用相似名称或共享URL兜底', async () => {
+  const f = fixture();
+  full(f, 'h', 'HUAWEI MateBook 14');
+  full(f, 'w', 'HUAWEI MateBook 14', false);
+  f.add('hc', cardPath('鸿蒙款', 1), '# HUAWEI MateBook 14（鸿蒙版）\n- 产品类别：鸿蒙电脑');
+  f.add('wc', cardPath('Windows款', 2), '# HUAWEI MateBook 14（Windows）\n- 产品类别：笔记本电脑');
+  for (const [i, name] of ['HUAWEI MateBook Fold 企业版', 'HUAWEI MateBook Fold 非凡大师', '华为无线鼠标 3 轻音版'].entries()) {
+    f.add(`extra${i}`, cardPath(name, i + 3), `# ${name}\n- 官方页面：https://example.invalid/shared`);
+  }
+  const names = ['HUAWEI MateBook 14（鸿蒙版）', 'HUAWEI MateBook 14（Windows）', 'HUAWEI MateBook Fold 企业版', 'HUAWEI MateBook Fold 非凡大师', '华为无线鼠标 3'];
+  for (const [i, name] of names.entries()) f.add(`p${i}`, pricePath(name), priceText(name));
+  for (const [id, expected] of [['hc', 'p0'], ['wc', 'p1'], ['extra0', 'p2'], ['extra1', 'p3']] as const) {
+    const evidence = await f.loadCatalogEvidence(`catalog:${id}`, { wantPrice: true });
+    assert.deepEqual([...new Set(evidence.filter(e => e.kind === 'price').map(e => e.docId))], [expected]);
+  }
+  assert.ok(!(await f.loadCatalogEvidence('catalog:extra2', { wantPrice: true })).some(e => e.kind === 'price'));
+});
+
+test('受限、归档价格永不绑定，歧义重名不取第一份，正文错名拒绝', async () => {
+  const f = fixture();
+  f.add('a', cardPath('新品'), '# 新品\n- 产品类别：鼠标');
+  for (const [i, p] of [`归档/${pricePath('新品')}`, `P4-机密/${pricePath('新品')}`, `${root}08-官方公开价格快照/归档/新品-价格卡.md`].entries()) f.add(`bad${i}`, p, priceText('新品'));
+  await f.loadCatalogEvidence('catalog:a', { wantPrice: true });
+  assert.deepEqual(f.reads, ['a']);
+  const g = fixture();
+  g.add('a', cardPath('新品'), '# 新品\n- 产品类别：鼠标');
+  g.add('p1', pricePath('新品'), priceText('新品'));
+  g.add('p2', `${root}08-官方公开价格快照/02-商用电脑/新品-价格卡.md`, priceText('新品'));
+  assert.ok(!(await g.loadCatalogEvidence('catalog:a', { wantPrice: true })).some(e => e.kind === 'price'));
+  const h = fixture();
+  h.add('a', cardPath('新品'), '# 新品\n- 产品类别：鼠标');
+  h.add('p', pricePath('新品'), priceText('其他型号'));
+  await assert.rejects(h.loadCatalogEvidence('catalog:a', { wantPrice: true }), /价格卡.*身份/);
+});
+
+test('价格正文缺失不影响普通问答，显式询价刷新失败不返回旧价格', async () => {
+  const f = fixture();
+  f.add('a', cardPath('新品'), '# 新品\n产品资料');
+  f.add('p', pricePath('新品'), priceText('新品'));
+  await f.loadCatalog();
+  f.texts.delete('p');
+  assert.ok((await f.loadCatalogEvidence('catalog:a')).length);
+  await assert.rejects(f.loadCatalogEvidence('catalog:a', { wantPrice: true }), /读取目录资料失败/);
+  f.texts.set('p', priceText('新品'));
+  assert.ok((await f.loadCatalogEvidence('catalog:a', { wantPrice: true })).some(e => e.kind === 'price'));
+  f.texts.delete('p');
+  await assert.rejects(f.loadCatalogEvidence('catalog:a', { refresh: true, wantPrice: true }), /读取目录资料失败/);
 });

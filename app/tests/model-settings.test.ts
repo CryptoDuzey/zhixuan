@@ -125,6 +125,21 @@ test('test makes one small request and does not return raw gateway content', asy
   assert.throws(() => readFileSync(join(directory, 'data/private/model-settings.json')));
 });
 
+test('connection test rejects truncated or blocked replies instead of reporting success', async (t) => {
+  for (const finish_reason of ['length', 'content_filter', 'tool_calls']) {
+    const transport = t.mock.method(globalThis, 'fetch', async () => Response.json({
+      choices: [{ message: { content: 'partial offline-server-key' }, finish_reason }],
+    }));
+    const response = await POST(request({ action: 'test', model: 'gpt-test' }));
+    const body = await response.json();
+    assert.equal(response.status, 502);
+    assert.equal(body.ok, false);
+    assert.doesNotMatch(JSON.stringify(body), /offline-server-key|partial/);
+    assert.equal(transport.mock.callCount(), 1);
+    transport.mock.restore();
+  }
+});
+
 test('gateway errors do not leak upstream bodies or trigger retries', async (t) => {
   const transport = t.mock.method(globalThis, 'fetch', async () => new Response('secret upstream offline-server-key', { status: 401 }));
   const response = await POST(request({ action: 'test', model: 'gpt-test' }));
@@ -196,6 +211,44 @@ test('timeouts abort one request and do not leak network exception details', asy
     return true;
   });
   assert.equal(transport.mock.callCount(), 1);
+});
+
+test('DeepSeek interactive calls reserve output for the answer; other gateways keep their own defaults', async t => {
+  for (const baseUrl of ['https://api.deepseek.com/v1', 'https://other.example/v1']) {
+    await POST(request({ action: 'save', baseUrl, apiKey: 'offline-deepseek-key', model: 'deepseek-flash' }));
+    const transport = t.mock.method(globalThis, 'fetch', async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.stream, true);
+      if (baseUrl.includes('api.deepseek.com')) assert.deepEqual(body.thinking, { type: 'disabled' });
+      else assert.equal(body.thinking, undefined);
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: '完整回复' } }] });
+    });
+    assert.equal((await chat([{ role: 'user', content: 'hi' }], { purpose: 'test', maxTokens: 16 })).text, '完整回复');
+    assert.equal(transport.mock.callCount(), 1);
+    transport.mock.restore();
+  }
+});
+
+test('explicit low reasoning applies only to DeepSeek and preserves enough answer budget', async t => {
+  for (const baseUrl of ['https://api.deepseek.com/v1', 'https://other.example/v1']) {
+    await POST(request({ action: 'save', baseUrl, apiKey: 'offline-deepseek-key', model: 'deepseek-flash' }));
+    const transport = t.mock.method(globalThis, 'fetch', async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (baseUrl.includes('api.deepseek.com')) {
+        assert.deepEqual(body.thinking, { type: 'enabled' });
+        assert.equal(body.reasoning_effort, 'low');
+        assert.equal(body.max_tokens, 8192);
+      } else {
+        assert.equal(body.thinking, undefined);
+        assert.equal(body.reasoning_effort, undefined);
+        assert.equal(body.max_tokens, 1000);
+      }
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: '可见正文', reasoning_content: '不应显示的推理内容' } }] });
+    });
+    assert.equal((await chat([{ role: 'user', content: 'revise' }], { purpose: 'revise', reasoning: 'low', maxTokens: 1000 })).text, '可见正文');
+    assert.equal(transport.mock.callCount(), 1);
+    transport.mock.restore();
+  }
 });
 
 test('save persists locally, never returns a key, and chat immediately uses it', async (t) => {

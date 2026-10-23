@@ -33,6 +33,20 @@ export class SessionStorageError extends Error {
 
 export const validSessionId = (id: string) => /^[\w-]{6,64}$/.test(id);
 const MAX_FILE_BYTES = 12 * 1024 * 1024;
+const renamePause = new Int32Array(new SharedArrayBuffer(4));
+
+/** Windows may briefly refuse replacing an existing file. Retry only that
+ * observed error, for at most 85ms, preserving the same atomic rename. */
+function replaceSessionFile(temporary: string, target: string) {
+  const delays = [10, 25, 50];
+  for (let attempt = 0; ; attempt++) {
+    try { renameSync(temporary, target); return; }
+    catch (error) {
+      if (process.platform !== 'win32' || (error as NodeJS.ErrnoException)?.code !== 'EPERM' || attempt >= delays.length) throw error;
+      Atomics.wait(renamePause, 0, 0, delays[attempt]);
+    }
+  }
+}
 
 function replaceContents(target: object, source: object) {
   for (const key of Object.keys(target)) Reflect.deleteProperty(target, key);
@@ -143,7 +157,7 @@ export class SessionRepository {
       if (Buffer.byteLength(text) > MAX_FILE_BYTES) throw new Error('oversize');
       mkdirSync(this.directory, { recursive: true, mode: 0o700 });
       writeFileSync(temporary, text, { mode: 0o600, flag: 'wx' });
-      renameSync(temporary, path);
+      replaceSessionFile(temporary, path);
       this.persisted.set(id, text);
     } catch {
       this.rollback(id);

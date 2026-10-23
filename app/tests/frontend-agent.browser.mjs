@@ -6,9 +6,9 @@ import { offlinePage } from './frontend-offline.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.FRONTEND_PLAYWRIGHT_PATH || 'playwright');
 const browser = await chromium.launch({
-  headless: true, ...(process.env.FRONTEND_BROWSER_PATH ? { executablePath: process.env.FRONTEND_BROWSER_PATH } : {}),
+  headless: true, executablePath: process.env.FRONTEND_BROWSER_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe',
 });
-const base = process.env.FRONTEND_BASE_URL || 'http://localhost:3117';
+const base = process.env.FRONTEND_BASE_URL || 'http://localhost:3100';
 const offline = process.env.FRONTEND_OFFLINE !== '0';
 const html = offlinePage('../app/components/Studio.tsx', ['../app/globals.css', '../app/canvas.css']);
 const screenshots = process.env.FRONTEND_SCREENSHOTS || '../artifacts/frontend-agent';
@@ -66,21 +66,21 @@ try {
     await emit(page, { type: 'step', label: '核对产品资料' });
     await emit(page, { type: 'tool', tool: 'knowledge', label: '读取产品资料', status: 'started' });
     await emit(page, { type: 'tool', tool: 'knowledge', label: '读取产品资料', status: 'completed', cacheHit: true, ms: 90 });
-    await page.getByText('已返回 · 使用缓存 · 0.1 秒').waitFor();
+    assert.equal(await page.locator('.tool-status,.activity').count(), 0);
     await emit(page, { type: 'draft', draft });
-    await page.getByText('草稿预览 · 尚未完成本版核验，暂不可导出。').waitFor();
-    assert.equal(await page.getByRole('button', { name: '核验后导出' }).isDisabled(), true);
+    await page.getByText('内容还在整理，稍后可以导出。').waitFor();
+    assert.equal(await page.getByRole('button', { name: '导出内容' }).isDisabled(), true);
     await page.screenshot({ path: `${screenshots}/desktop-pending.png`, fullPage: true });
     await emit(page, { type: 'check', report });
     await emit(page, { type: 'done', view: { ...view, report }, run: { ...run, status: 'completed' } }, true);
-    await page.getByText('第 1 版已核验，没有发现问题。').waitFor();
-    assert.equal(await page.getByRole('button', { name: '核验后导出' }).isEnabled(), true);
+    await page.getByText('写好了，看看这个版本。').waitFor();
+    assert.equal(await page.getByRole('button', { name: '导出内容' }).isEnabled(), true);
   });
   await scenario('mobile unverified terminal draft stays pending; no success claim or overflow', async (page) => {
     await emit(page, { type: 'draft', draft });
     await emit(page, { type: 'done', view, run: { ...run, status: 'completed' } }, true);
-    await page.getByText('第 1 版草稿已保存，尚未完成核验。').waitFor();
-    assert.equal(await page.getByRole('button', { name: '核验后导出' }).isDisabled(), true);
+    await page.getByText('草稿放好了，还需要稍作整理。').waitFor();
+    assert.equal(await page.getByRole('button', { name: '导出内容' }).isDisabled(), true);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await page.screenshot({ path: `${screenshots}/mobile-pending.png`, fullPage: true });
   }, true);
@@ -107,7 +107,7 @@ try {
     await page.getByText('任务已停止，已保留最近保存的内容').waitFor();
     assert.ok(gets >= 2);
     assert.equal(await page.getByRole('textbox').isEnabled(), true);
-    assert.equal(await page.getByRole('button', { name: '核验后导出' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: '导出内容' }).isDisabled(), true);
     await page.screenshot({ path: `${screenshots}/desktop-cancelled.png`, fullPage: true });
   });
   await scenario('failed knowledge service remains explicit and cannot imply verified completion', async (page) => {
@@ -122,10 +122,10 @@ try {
     const failed = { ...report, status: 'needs_fix' };
     await emit(page, { type: 'draft', draft });
     await emit(page, { type: 'done', view: { ...view, report: failed } }, true);
-    await page.getByText('第 1 版 · 核验未通过').waitFor();
-    assert.equal(await page.getByRole('button', { name: '核验后导出' }).isDisabled(), true);
-    await page.getByRole('button', { name: '查看依据' }).click();
-    await page.getByText('这一版核验未通过，暂时没有返回具体问题，请重新核验后再导出。').waitFor();
+    await page.getByText('第 1 版 · 需要调整').waitFor();
+    assert.equal(await page.getByRole('button', { name: '导出内容' }).isDisabled(), true);
+    await page.getByRole('button', { name: '内容建议' }).click();
+    await page.getByText('这版还需要调整，暂时不能导出。可以让知选重新整理一次。').waitFor();
     assert.equal(await page.getByText('没有发现问题。', { exact: false }).count(), 0);
   });
   await scenario('cancel conflict refreshes authoritative terminal state without generating again', async (page) => {
@@ -143,7 +143,7 @@ try {
     await page.getByText('任务等待超时，已保留最近保存的内容').waitFor();
     assert.equal(cancels, 1);
     assert.equal(await page.getByRole('textbox').isEnabled(), true);
-    assert.equal(await page.getByRole('button', { name: '核验后导出' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: '导出内容' }).isDisabled(), true);
   });
   console.log(`All ${passed} agent browser scenarios passed. Screenshots: ${screenshots}`);
 } finally { await browser.close(); }

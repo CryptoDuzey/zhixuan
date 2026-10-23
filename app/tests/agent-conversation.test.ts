@@ -1,11 +1,13 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createDraft, editDraft, handleMessage, newSession, reviseDraft, writeFromNeed, type AgentEvent, type NeedCard } from '../lib/agent.ts';
 import { createRun, withRun } from '../lib/agent-runtime.ts';
 import { createConversationSources } from '../lib/agent-conversation.ts';
 import type { CatalogEntry } from '../lib/catalog.ts';
-import type { ImageRef } from '../lib/facts.ts';
+import type { Evidence, ImageRef } from '../lib/facts.ts';
+import { reviewFixture } from './claim-review-fixture.ts';
 
 const root = 'P1-产品参数库/';
 const documents = [
@@ -36,9 +38,10 @@ function transport(t: TestContext, answers: unknown[]) {
       const request = JSON.parse(String(init?.body));
       calls.push(request);
       assert.ok(answers.length, '不应增加额外模型调用');
-      return Response.json({ choices: [{ message: { content: JSON.stringify(answers.shift()) } }] });
+      const answer = answers.shift();
+      return answer instanceof Response ? answer : Response.json({ choices: [{ message: { content: JSON.stringify(answer === checked ? reviewFixture(request.messages[1].content) : answer) } }] });
     }
-    if (url.pathname === '/documents') return Response.json({ items: documents.map((doc) => ({ ...doc, title: doc.path.split('/').at(-1), bytes: 100, sha256: '' })) });
+    if (url.pathname === '/documents') return Response.json({ items: documents.map((doc) => ({ ...doc, title: doc.path.split('/').at(-1), bytes: 100, sha256: createHash('sha256').update(doc.text).digest('hex') })) });
     if (url.pathname === '/document') {
       const doc = documents.find((item) => item.id === url.searchParams.get('id'));
       assert.ok(doc, '不得读取其他产品或虚构资料');
@@ -62,11 +65,11 @@ test('默认入口：问候交由模型回复，无五款选择；对话历史�
   assert.equal(s.modelId, '');
 });
 
-test('默认入口：未选型号可自主用目录完整产品写稿，缺图仍交文字且核验引用', async (t) => {
-  const calls = transport(t, [route(), article(), checked]);
+test('默认入口：图库偏好不覆盖写新稿意图，缺图仍交文字且核验引用', async (t) => {
+  const calls = transport(t, [route({ imageRequest: { allowGeneration: false } }), article(), checked]);
   const s = newSession();
   const events: AgentEvent[] = [];
-  await withRun('offline-marketing', createRun(), () => {}, () => handleMessage('给学生写一篇朋友圈，你来选合适产品', s, (event) => events.push(event)), { maxModelAttempts: 3 });
+  await withRun('offline-marketing', createRun(), () => {}, () => handleMessage('给学生写一篇朋友圈，你来选合适产品，只用现有图库，不写口号，只讲一个参数', s, (event) => events.push(event)), { maxModelAttempts: 3 });
   assert.equal(s.draft?.modelId, 'catalog:new-win');
   assert.deepEqual(s.draft?.images, []);
   assert.ok(s.evidence?.every((item) => item.id.startsWith('catalog:new-win:')));
@@ -74,6 +77,7 @@ test('默认入口：未选型号可自主用目录完整产品写稿，缺图�
   assert.ok(events.some((event) => event.type === 'check'));
   assert.ok(!events.some((event) => event.type === 'clarify'));
   assert.match(calls[1].messages[1].content, /仅新款 Windows/);
+  assert.match(calls[1].messages[1].content, /不写口号，只讲一个参数/, '需求卡没有记下的表达偏好，也必须传入实际写作');
   assert.doesNotMatch(calls[1].messages[1].content, /仅新款鸿蒙/);
   assert.equal(calls.length, 3);
 });
@@ -148,7 +152,7 @@ test('本型号图片读取失败时仍交付有证据的文字草稿，并提�
   await writeFromNeed(need as NeedCard, '写朋友圈', s, (event) => events.push(event), sources);
   assert.ok(s.draft?.body);
   assert.deepEqual(s.draft?.images, []);
-  assert.ok(events.some((event) => event.type === 'notice' && /无法读取.*补图/.test(event.text)));
+  assert.equal(events.filter((event) => event.type === 'notice' && /补图/.test(event.text)).length, 1);
   assert.equal(s.report?.draftVersion, s.draft?.version);
   assert.ok(!s.report?.issues.some((issue) => issue.type === 'fabricated'));
 });
@@ -174,6 +178,123 @@ test('默认入口：换系统后清除旧稿和需求，只用新版本资料�
   assert.equal(s.draft?.version, 3);
   assert.equal(s.report?.draftVersion, 3);
   assert.ok(s.report?.issues.some((issue) => issue.type === 'image'));
+});
+
+test('同产品需求修正：采用本轮完整需求，不把撤回条件和已解决疑问重新合并进稿件', async (t) => {
+  const calls = transport(t, [
+    route({ facts_from_user: ['预算六千', '每天带去上课', '作者是门店运营'], unknowns: ['预算是否包含配件待确认'] }), article(), checked,
+    route({ audience: '居家办公者', scene: '固定桌面', facts_from_user: ['预算八千，含配件', '固定放在家里', '作者是门店运营'], unknowns: [] }), article(), checked,
+  ]);
+  const s = newSession();
+  await handleMessage('预算六千，每天带去上课，写朋友圈', s, () => {});
+  await handleMessage('改成居家办公，固定放家里，预算八千含配件，不再每天带出门', s, () => {});
+  assert.deepEqual(s.need?.facts_from_user, ['预算八千，含配件', '固定放在家里', '作者是门店运营']);
+  assert.deepEqual(s.need?.unknowns, []);
+  assert.doesNotMatch(calls[4].messages[1].content, /预算六千|每天带去上课|配件待确认/);
+  assert.match(calls[4].messages[1].content, /预算八千|固定放在家里/);
+  assert.match(calls[4].messages[1].content, /作者是门店运营/);
+});
+
+test('重新写稿失败时旧稿、旧核验和旧证据保持同一版本，进度保存也不混入新资料', async (t) => {
+  transport(t, [article(), checked, Response.json({ error: { code: 'insufficient_quota' } }, { status: 429 }), article(), checked]);
+  const entry: CatalogEntry = {
+    id: 'catalog:new-win', name: '测试产品', category: '电脑', system: 'Windows', level: 'full',
+    docPath: '产品事实', evidencePaths: ['产品事实'], specsAvailable: true, note: '',
+  };
+  let revision = 1;
+  const sources = createConversationSources([entry], {
+    loadCatalogEvidence: async () => [{ id: 'catalog:new-win:E1', kind: 'fact', text: `资料版本${revision}` } as Evidence],
+    loadImages: async () => [],
+  });
+  const s = { ...newSession(), modelId: entry.id, modelName: entry.name };
+  await writeFromNeed(need as NeedCard, '写朋友圈', s, () => {}, sources);
+  const previous = structuredClone({ draft: s.draft, report: s.report, evidence: s.evidence, images: s.images });
+  revision = 2;
+  const saved: unknown[] = [];
+  await assert.rejects(writeFromNeed(need as NeedCard, '换个切入角度重新写', s, () => {
+    saved.push(structuredClone({ draft: s.draft, report: s.report, evidence: s.evidence, images: s.images }));
+  }, sources), /额度不足/);
+  assert.deepEqual({ draft: s.draft, report: s.report, evidence: s.evidence, images: s.images }, previous);
+  for (const snapshot of saved) assert.deepEqual(snapshot, previous);
+  let published = false;
+  await writeFromNeed(need as NeedCard, '重试写稿', s, event => {
+    if (event.type !== 'draft') return;
+    published = true;
+    assert.equal(s.draft?.version, 2);
+    assert.equal(s.evidence?.[0].text, '资料版本2');
+    assert.equal(s.report, undefined, '新版不能沿用旧核验');
+  }, sources);
+  assert.equal(published, true);
+  assert.equal(s.report?.draftVersion, 2);
+});
+
+test('目录改稿重新读取本型号依据，失败保留旧依据，成功后新版核验使用新依据', async (t) => {
+  const calls = transport(t, [article(), checked,
+    Response.json({ error: { code: 'insufficient_quota' } }, { status: 429 }), article(), checked, article(), checked]);
+  const entry: CatalogEntry = {
+    id: 'catalog:new-win', name: '测试产品', category: '电脑', system: 'Windows', level: 'full',
+    docPath: '产品事实', evidencePaths: ['产品事实'], specsAvailable: true, note: '',
+  };
+  let revision = 1;
+  let reads = 0;
+  const sources = createConversationSources([entry], {
+    loadCatalogEvidence: async id => {
+      assert.equal(id, entry.id);
+      reads++;
+      return [{ id: 'catalog:new-win:E1', kind: 'fact', text: `资料版本${revision}` } as Evidence];
+    },
+    loadImages: async () => [],
+  });
+  sources.loadImages = async () => [{ id: 'IMG1', docId: `image-${revision}`, filename: `image-${revision}.jpg`,
+    modelId: entry.id, modelName: entry.name, caption: `画面版本${revision}`, visuallyReviewed: true,
+    purpose: '配图', width: 800, height: 600, source: '本地已下载知识库', url: '' }];
+  const s = { ...newSession(), modelId: entry.id, modelName: entry.name };
+  await writeFromNeed(need as NeedCard, '写朋友圈', s, () => {}, sources);
+  const previous = structuredClone({ draft: s.draft, report: s.report, evidence: s.evidence, images: s.images });
+  revision = 2;
+  await assert.rejects(reviseDraft('修改表述', s, () => {}, sources), /额度不足/);
+  assert.match(calls[2].messages[1].content, /资料版本2/);
+  assert.match(calls[2].messages[1].content, /画面版本2/);
+  assert.deepEqual({ draft: s.draft, report: s.report, evidence: s.evidence, images: s.images }, previous);
+  await reviseDraft('重试修改', s, event => {
+    if (event.type === 'draft') {
+      assert.equal(s.evidence?.[0].text, '资料版本2');
+      assert.equal(s.images?.[0].docId, 'image-2');
+      assert.equal(s.report, undefined);
+    }
+  }, sources);
+  assert.equal(reads, 3);
+  assert.match(calls[4].messages[1].content, /资料版本2/);
+  assert.equal(s.report?.draftVersion, 2);
+  sources.loadImages = async () => { throw new Error('images unavailable'); };
+  const events: AgentEvent[] = [];
+  await reviseDraft('只保留能核实的内容', s, event => events.push(event), sources);
+  assert.deepEqual(s.images, []);
+  assert.deepEqual(s.draft?.images, []);
+  assert.equal(s.report?.draftVersion, 3);
+  assert.ok(events.some(event => event.type === 'notice' && /发布前需要补图/.test(event.text)));
+});
+
+test('写稿区分预算与询价，改稿明确撤回报价后不再提供价格卡', async (t) => {
+  const calls = transport(t, [article(), checked, article(), checked, article(), checked]);
+  const entry: CatalogEntry = {
+    id: 'catalog:new-win', name: '测试产品', category: '电脑', system: 'Windows', level: 'full',
+    docPath: '产品事实', evidencePaths: ['产品事实'], specsAvailable: true, note: '',
+  };
+  const sources = createConversationSources([entry], {
+    loadCatalogEvidence: async () => [
+      { id: 'catalog:new-win:E1', kind: 'fact', text: '本型号事实' } as Evidence,
+      { id: 'catalog:new-win:E2', kind: 'price', text: '限定配置历史价格卡' } as Evidence,
+    ],
+    loadImages: async () => [],
+  });
+  const s = { ...newSession(), modelId: entry.id, modelName: entry.name };
+  await writeFromNeed(need as NeedCard, '预算六千，写朋友圈，不用报价', s, () => {}, sources);
+  assert.doesNotMatch(calls[0].messages[1].content, /限定配置历史价格卡/);
+  await reviseDraft('补上有依据的历史价格', s, () => {}, sources);
+  assert.match(calls[2].messages[1].content, /限定配置历史价格卡/);
+  await reviseDraft('先别报价，只讲用途', s, () => {}, sources);
+  assert.doesNotMatch(calls[4].messages[1].content, /限定配置历史价格卡/);
 });
 
 test('目录素材映射：只转换明确映射的本型号图片，其他产品不借图，证据编号不改写', async () => {

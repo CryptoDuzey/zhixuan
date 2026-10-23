@@ -104,10 +104,10 @@ export function createConsultHandlers(options: {
       if (!repository.begin(id)) return errorResponse(new ConsultError(409, '这项咨询仍在进行，请先等待或停止。'));
     } catch (error) { return errorResponse(error); }
     const run = record.run!;
-    const messages: ConsultMessage[] = record.turns.slice(0, -1).flatMap((turn): ConsultMessage[] => turn.answer ? [
+    const messages: ConsultMessage[] = record.turns.slice(0, -1).flatMap((turn): ConsultMessage[] => [
       { role: 'user', content: turn.question },
-      { role: 'assistant', content: turn.answer.reply.slice(0, 2000) },
-    ] : []).slice(-22);
+      ...(turn.answer ? [{ role: 'assistant' as const, content: turn.answer.reply.slice(0, 2000) }] : []),
+    ]).slice(-22);
     messages.push({ role: 'user', content: question });
     const sse = (request.headers.get('accept') ?? '').split(',').some((item) => item.trim().split(';')[0] === 'text/event-stream');
     const encoder = new TextEncoder();

@@ -50,6 +50,24 @@ test('选购SSE按步骤输出，保存回答和服务端历史；旧JSON调用�
   assert.deepEqual(await legacy.json(), answer);
 });
 
+test('前次失败后的代词追问仍带用户原型号，不捏造一次成功回答', async t => {
+  const { repository } = fixture(t); let attempt = 0;
+  const handlers = createConsultHandlers({ repository, execute: async body => {
+    attempt++;
+    if (attempt === 1) throw new Error('temporary tool failure');
+    const messages = (body as { messages: ConsultMessage[] }).messages;
+    assert.deepEqual(messages, [
+      { role: 'user', content: 'MateBook Pro S多少钱' },
+      { role: 'user', content: '联网查一下这个型号' },
+    ]);
+    return answer;
+  } });
+  const first = await events(await handlers.POST(post({ sessionId: 'failed-then-follow', message: 'MateBook Pro S多少钱' })));
+  assert.equal(first.at(-1).run.status, 'failed');
+  const second = await events(await handlers.POST(post({ sessionId: 'failed-then-follow', message: '联网查一下这个型号' })));
+  assert.equal(second.at(-1).run.status, 'completed');
+});
+
 test('咨询收尾期间连续GET和第二POST，20轮不被旧任务覆盖或误取消', async (t) => {
   const { directory, repository } = fixture(t);
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('No network permitted'); });

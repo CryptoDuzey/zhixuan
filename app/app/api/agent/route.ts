@@ -4,6 +4,7 @@ import { SessionStorageError, validSessionId, type SavedMessage } from '../../..
 import { withCallScope } from '../../../lib/ima.ts';
 import { createRun, encodeRunEvent, releaseRun, RunStoppedError, throwIfStopped, withRun } from '../../../lib/agent-runtime.ts';
 import { ModelSettingsError } from '../../../lib/model-settings.ts';
+import { draftMessage } from '../../../lib/draft-message.ts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -22,7 +23,7 @@ export async function GET(req: Request) {
     const record = recoverSession(id);
     if (!record) return Response.json({ error: '未找到工作记录。' }, { status: 404, headers });
     return Response.json({
-      view: toView(record.session), messages: record.messages,
+      view: toView(record.session, id), messages: record.messages,
       busy: record.busy, interrupted: record.interrupted, updatedAt: record.updatedAt,
       run: record.run,
     }, { headers });
@@ -80,7 +81,7 @@ export async function POST(req: Request) {
     const pending = sessionRepository.get(id);
     if (pending.busy) return Response.json({ error: '这项任务仍在进行，请等待完成后继续。' }, { status: 409, headers });
     pending.run = createRun();
-    pending.messages.push({ role: 'user', text: message || '直接编辑稿件并重新核验' });
+    pending.messages.push({ role: 'user', text: message || '修改稿件' });
     pending.messages = pending.messages.slice(-80);
     sessionRepository.begin(id);
   } catch (error) {
@@ -93,6 +94,7 @@ export async function POST(req: Request) {
   const working = structuredClone(record.session);
   // 历史由服务端提供，不信任浏览器拼接的助手身份。
   const history = record.messages.slice(0, -1).map((m) => `${m.role === 'user' ? '用户' : '助手'}：${m.text}`).join('\n').slice(-3000);
+  const trustedTurns = record.messages.slice(0, -1).map(m => ({ role: m.role, content: m.text }));
   const enc = new TextEncoder();
   const sse = (req.headers.get('accept') ?? '').split(',').some((value) => value.trim().split(';')[0] === 'text/event-stream');
   let disconnected = false;
@@ -106,11 +108,13 @@ export async function POST(req: Request) {
       send({ type: 'run', run });
       const heartbeat = sse ? setInterval(() => send({ type: 'heartbeat' }), 15_000) : undefined;
       let failed = false;
+      let deliveredDraft = false;
       const emit = (event: AgentEvent) => {
         throwIfStopped();
         const current = sessionRepository.get(id);
         if (current.run?.id !== run.id || !current.busy) throw new RunStoppedError('cancelled');
         if (event.type === 'step') run.phase = event.label;
+        if (event.type === 'draft') deliveredDraft = true;
         current.run = run;
         current.session = structuredClone(working);
         let saved: SavedMessage | undefined;
@@ -132,18 +136,15 @@ export async function POST(req: Request) {
           } catch (error) { traceError = error; }
         }, async () => {
           if (patch) await editDraft(clean, working, emit);
-          else await handleMessage(message, working, emit, history);
+          else await handleMessage(message, working, emit, history, undefined, trustedTurns);
           throwIfStopped();
         }), { retainUntilReleased: true });
         if (traceError) throw traceError;
         const latest = sessionRepository.get(id).session;
-        if (!failed && latest.draft) {
+        if (!failed && deliveredDraft && latest.draft) {
           const d = latest.draft;
           const r = latest.report;
-          const current = r?.draftVersion === d.version;
-          sessionRepository.appendMessage(id, { role: 'assistant', kind: 'agent', text: current
-            ? `第 ${d.version} 版已核验，${r!.issues.filter((i) => i.severity === 'block').length} 项必须处理，${r!.issues.filter((i) => i.severity !== 'block').length} 项建议留意。`
-            : `已保留第 ${d.version} 版，当前版本尚未完成核验。` });
+          sessionRepository.appendMessage(id, { role: 'assistant', kind: 'agent', text: draftMessage(d, r) });
         }
       } catch (error) {
         failed = true;
@@ -159,7 +160,7 @@ export async function POST(req: Request) {
         try {
           sessionRepository.get(id).run = run;
           sessionRepository.finish(id);
-          send({ type: 'done', view: toView(sessionRepository.get(id).session), run });
+          send({ type: 'done', view: toView(sessionRepository.get(id).session, id), run });
         } catch (error) {
           send({ type: 'error', text: storageMessage(error) });
         } finally {

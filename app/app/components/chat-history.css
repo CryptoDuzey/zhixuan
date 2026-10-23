@@ -1,0 +1,27 @@
+.history-trigger { display:inline-grid; place-items:center; width:32px; height:32px; border-radius:9px; color:var(--ink-2); flex:none; }
+.history-trigger:hover { background:var(--canvas); color:var(--ink); }
+.history-dialog { position:fixed; inset:0 auto 0 0; height:100dvh; max-height:100dvh; width:min(320px,90vw); max-width:90vw; margin:0; padding:0; border:0; border-right:1px solid var(--line); background:#f3f0ea; color:var(--ink); box-shadow:18px 0 70px #20191216; }
+.history-dialog::backdrop { background:#211e1938; backdrop-filter:blur(3px); }
+.history-panel { display:flex; flex-direction:column; height:100%; padding:24px 18px 18px; }
+.history-heading { display:flex; align-items:center; justify-content:space-between; margin-bottom:24px; }
+.history-heading span { color:var(--ink-2); font-size:11px; letter-spacing:1px; }
+.history-heading h2 { margin:5px 0 0; font-size:22px; font-weight:500; }
+.history-heading > button { width:32px; height:32px; font-size:24px; color:var(--ink-2); }
+.history-new { text-align:left; background:var(--ink); color:#fff; border-radius:12px; padding:11px 14px; }
+.history-new span { font-size:19px; margin-right:7px; }
+.history-search { margin:18px 0 12px; }
+.history-search input { width:100%; border:1px solid var(--line); border-radius:10px; background:#ffffff70; padding:9px 12px; outline-offset:2px; }
+.history-list { flex:1; min-height:0; overflow:auto; }
+.history-list p { font-size:13px; line-height:1.8; color:var(--ink-2); padding:10px; }
+.history-list p button { text-decoration:underline; }
+.history-list nav { display:grid; gap:4px; }
+.history-list nav button { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; min-width:0; padding:12px 11px; border-radius:10px; text-align:left; }
+.history-list nav button:hover { background:#fff9; }
+.history-list nav button.active { background:var(--paper); box-shadow:0 1px 7px #211e1907; }
+.history-list nav button > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+.history-list small { flex:none; font-size:10px; color:var(--ink-2); }
+.history-more { width:100%; padding:16px; color:var(--ink-2); font-size:12px; }
+.history-bottom { display:grid; gap:14px; padding:20px 4px 0; border-top:1px solid var(--line); }
+.history-bottom a { color:var(--ink); text-decoration:none; font-size:12px; }
+.history-bottom a span { float:right; }
+.history-bottom > span { font-size:10px; color:var(--ink-2); }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runDeterministicChecks, isCheckCurrent, type Draft } from '../lib/check.ts';
+import { runDeterministicChecks, isCheckCurrent, hasCompleteClaimReview, type Draft } from '../lib/check.ts';
 import type { ImageRef } from '../lib/facts.ts';
 
 const img = (n: number, modelId = 'pro-s'): ImageRef => ({
@@ -39,6 +39,21 @@ test('绝对化与承诺词拦截', () => {
   assert.ok(types(draft({ cta: '叠加补贴到手价，今天最后一天' })).includes('promise'));
 });
 
+test('明确否定保证或承诺不当成正向承诺，但双重否定和后句保证仍拦截', () => {
+  for (const body of ['不能保证所有软件都能运行。', '内存数值不能用来承诺应用启动时间。', '不要直接承诺使用效果。']) {
+    assert.ok(!types(draft({ body })).includes('promise'), body);
+  }
+  for (const body of ['不能不保证能用。', '并非不能保证能用。', '不保证所有软件，但我们保证这个插件能用。']) {
+    assert.ok(types(draft({ body })).includes('promise'), body);
+  }
+});
+
+test('朋友圈按实际发布全文计字，不能正文合格却叠加长标题导语和结尾', () => {
+  const d = draft({ platform: '朋友圈', title: '标题'.repeat(15), lead: '导语'.repeat(15), body: '正文'.repeat(50),
+    cta: '结尾'.repeat(20), images: [{ imageId: 'IMG1', position: '正文后', caption: '产品外观' }] });
+  assert.ok(runDeterministicChecks(d, images).issues.some(issue => issue.type === 'format' && issue.location === '全文'));
+});
+
 test('虚构第一人称体验', () => {
   assert.ok(types(draft({ body: '我用了三个月，续航很稳' })).includes('fabricated'));
 });
@@ -59,6 +74,16 @@ test('核验结果绑定稿件版本', () => {
   assert.ok(!isCheckCurrent(r, draft({ version: 2 })));
 });
 
+test('历史pass不代表覆盖完整，缺项、重复或错编号不能显示为就绪', () => {
+  const d = draft();
+  const r = runDeterministicChecks(d, images);
+  assert.equal(hasCompleteClaimReview(r, d), false);
+  for (const reviewedClaimIds of [[], ['C2'], ['C1', 'C1']]) {
+    assert.equal(hasCompleteClaimReview({ ...r, reviewedClaimIds }, d), false);
+  }
+  assert.equal(hasCompleteClaimReview({ ...r, reviewedClaimIds: ['C1'] }, d), true);
+});
+
 test('第一台/第一学期不误伤，销量第一拦截', () => {
   assert.ok(!types(draft({ title: '选第一台笔记本', body: '第一学期要装的软件' })).includes('absolute'));
   assert.ok(!types(draft({ body: '第一项取舍是接口，第一种场景是差旅' })).includes('absolute'));
@@ -67,7 +92,7 @@ test('第一台/第一学期不误伤，销量第一拦截', () => {
 
 test('平台篇幅/标签/表情为建议级提示，不阻断', () => {
   const r = runDeterministicChecks(draft({ platform: '朋友圈', body: '短'.repeat(200), images: [{ imageId: 'IMG1', position: 'a', caption: 'c' }] }), images);
-  assert.ok(r.issues.some((i) => i.type === 'format' && i.location === '正文'));
+  assert.ok(r.issues.some((i) => i.type === 'format' && i.location === '全文'));
   assert.ok(r.issues.filter((i) => i.type === 'format').every((i) => i.severity === 'warn'));
   const e = runDeterministicChecks(draft({ platform: '朋友圈', body: '😀😀😀😀'.repeat(10), images: [{ imageId: 'IMG1', position: 'a', caption: 'c' }] }), images);
   assert.ok(e.issues.some((i) => i.type === 'format' && i.location === '全文'));

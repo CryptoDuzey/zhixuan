@@ -1,5 +1,6 @@
 import { after, before, beforeEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { loadEvidence, loadImages } from '../lib/facts.ts';
 
 // Independent fixture paths: do not derive expected directories from MODELS.
@@ -45,7 +46,7 @@ const requests: { pathname: string; id: string | null }[] = [];
 function addDocument(id: string, path: string, text?: string) {
   documents.push({
     id, title: path.split('/').at(-1)!, path: `模拟知识库/${path}`.replaceAll('/', '\\'),
-    bytes: text === undefined ? 1 : Buffer.byteLength(text), sha256: 'offline-fixture',
+    bytes: text === undefined ? 1 : Buffer.byteLength(text), sha256: createHash('sha256').update(text ?? '').digest('hex'),
   });
   if (text !== undefined) contents.set(id, text);
 }

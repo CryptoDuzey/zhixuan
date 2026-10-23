@@ -2,6 +2,7 @@
 import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { constants } from 'node:os';
 import type { ConsultAnswer } from './consult.ts';
 import type { CallLog } from './ima.ts';
 import type { RunState } from './agent-runtime.ts';
@@ -24,6 +25,32 @@ export interface SavedConsult {
 }
 
 const MAX_FILE_BYTES = 12 * 1024 * 1024;
+const renamePause = new Int32Array(new SharedArrayBuffer(4));
+
+// Match session-store's bounded Windows EPERM handling. Keep the same source
+// and destination for every atomic rename; never remove the saved destination.
+function replaceConsultFile(temporary: string, target: string) {
+  const delays = [10, 25, 50];
+  for (let attempt = 0; ; attempt++) {
+    try { renameSync(temporary, target); return; }
+    catch (error) {
+      if (process.platform !== 'win32' || (error as NodeJS.ErrnoException)?.code !== 'EPERM' || attempt >= delays.length) throw error;
+      Atomics.wait(renamePause, 0, 0, delays[attempt]);
+    }
+  }
+}
+
+// Never log messages, stacks, paths, record contents, or arbitrary error fields.
+function safeCause(error: unknown, depth = 0): object {
+  const value = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  return {
+    name: ['Error', 'TypeError', 'RangeError', 'SyntaxError'].includes(String(value.name)) ? value.name : 'UnknownError',
+    ...(typeof value.code === 'string' && Object.hasOwn(constants.errno, value.code) ? { code: value.code } : {}),
+    ...(typeof value.syscall === 'string' && ['rename', 'open', 'write', 'mkdir', 'stat', 'read', 'unlink'].includes(value.syscall)
+      ? { syscall: value.syscall } : {}),
+    ...(value.cause && depth < 2 ? { cause: safeCause(value.cause, depth + 1) } : {}),
+  };
+}
 
 function replaceContents(target: object, source: object) {
   for (const key of Object.keys(target)) Reflect.deleteProperty(target, key);
@@ -147,14 +174,21 @@ export class ConsultRepository {
     id = this.key(id);
     const path = this.path(id);
     const temporary = `${path}.${randomUUID()}.tmp`;
+    let operation = 'serialize';
     try {
       const text = JSON.stringify(record);
       if (Buffer.byteLength(text) > MAX_FILE_BYTES) throw new Error('oversize');
+      operation = 'mkdir';
       mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+      operation = 'write';
       writeFileSync(temporary, text, { mode: 0o600, flag: 'wx' });
-      renameSync(temporary, path);
+      operation = 'rename';
+      replaceConsultFile(temporary, path);
       this.persisted.set(id, text);
-    } catch {
+    } catch (error) {
+      try {
+        console.error('[consult-store]', JSON.stringify({ event: 'consult_storage_failure', operation, cause: safeCause(error) }));
+      } catch { /* Diagnostics must not prevent rollback or replace the storage error. */ }
       this.rollback(id);
       throw new SessionStorageError();
     } finally {
